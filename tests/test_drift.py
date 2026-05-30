@@ -26,14 +26,45 @@ def test_extract_doc_id_returns_none_for_garbage():
     assert drift.extract_doc_id("") is None
 
 
-def test_doc_id_for_backup_truncates_to_16():
-    long_id = "X" * 44
-    assert drift.doc_id_for_backup(long_id) == "X" * 16
+def test_safe_doc_key_keeps_valid_id_verbatim():
+    valid = "ABCdef_123-xyz"
+    assert drift.safe_doc_key(valid) == valid
 
 
-def test_doc_id_for_baseline_keeps_full_id():
-    long_id = "X" * 44
-    assert drift.doc_id_for_baseline(long_id) == long_id
+def test_safe_doc_key_extracts_from_url():
+    url = "https://docs.google.com/document/d/REAL_ID_42/edit"
+    assert drift.safe_doc_key(url) == "REAL_ID_42"
+
+
+def test_safe_doc_key_hashes_unsafe_input():
+    hostile = "../../etc/passwd"
+    key = drift.safe_doc_key(hostile)
+    assert key.startswith("h_")
+    assert "/" not in key and ".." not in key
+    assert len(key) == 2 + 32
+
+
+def test_safe_doc_key_hashes_unicode():
+    key = drift.safe_doc_key("doc id with spaces")
+    assert key.startswith("h_")
+
+
+def test_safe_doc_key_none_or_empty():
+    assert drift.safe_doc_key(None) == "unknown"
+    assert drift.safe_doc_key("") == "unknown"
+
+
+def test_distinct_doc_ids_sharing_16_char_prefix_do_not_collide():
+    # Codex CRITICAL #1: pre-v0.3.1 the 16-char truncation made these collide.
+    id_a = "AAAAAAAAAAAAAAAA_first_distinct"
+    id_b = "AAAAAAAAAAAAAAAA_second_distinct"
+    assert drift.safe_doc_key(id_a) != drift.safe_doc_key(id_b)
+
+
+def test_legacy_shim_doc_id_for_baseline():
+    # Back-compat alias still returns the same safe key.
+    assert drift.doc_id_for_baseline("MY_DOC") == drift.safe_doc_key("MY_DOC")
+    assert drift.doc_id_for_backup("MY_DOC") == drift.safe_doc_key("MY_DOC")
 
 
 def test_default_backup_dir_env_override(monkeypatch, tmp_path):
@@ -135,7 +166,49 @@ def test_resolve_backup_dir_accepts_str_or_path(tmp_path):
     assert drift.resolve_backup_dir(tmp_path) == tmp_path
 
 
-def test_backup_base_path_uses_short_id(tmp_path):
+def test_backup_base_path_uses_full_id(tmp_path):
     doc = "https://docs.google.com/document/d/" + "Z" * 44 + "/edit"
     base = drift.backup_base_path(tmp_path, doc, timestamp="20260101_000000")
-    assert base.name == "doc_backup_20260101_000000_" + "Z" * 16
+    assert base.name == "doc_backup_20260101_000000_" + "Z" * 44
+
+
+def test_atomic_write_text_replaces_existing(tmp_path):
+    target = tmp_path / "_last_pushed_ABC.txt"
+    target.write_text("OLD", encoding="utf-8")
+    drift.atomic_write_text(target, "NEW")
+    assert target.read_text(encoding="utf-8") == "NEW"
+    # No tmp file should be left behind on success.
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == []
+
+
+def test_atomic_write_text_creates_parents(tmp_path):
+    nested = tmp_path / "a" / "b" / "c.txt"
+    drift.atomic_write_text(nested, "hello")
+    assert nested.read_text(encoding="utf-8") == "hello"
+
+
+def test_list_backups_does_not_mix_two_docs(tmp_path):
+    # CRITICAL #1 regression: pre-v0.3.1 these distinct ids shared a 16-char
+    # prefix and list_backups returned the other Doc's backups too.
+    id_a = "AAAAAAAAAAAAAAAA_first"
+    id_b = "AAAAAAAAAAAAAAAA_second"
+    a_base = drift.backup_base_path(tmp_path, id_a, timestamp="20260101_000000")
+    b_base = drift.backup_base_path(tmp_path, id_b, timestamp="20260102_000000")
+    a_base.with_suffix(".txt").write_text("from doc A")
+    b_base.with_suffix(".txt").write_text("from doc B")
+    a_list = drift.list_backups(id_a, tmp_path)
+    b_list = drift.list_backups(id_b, tmp_path)
+    assert len(a_list) == 1
+    assert len(b_list) == 1
+    assert a_list[0]["txt"].read_text() == "from doc A"
+    assert b_list[0]["txt"].read_text() == "from doc B"
+
+
+def test_save_last_push_is_atomic(tmp_path):
+    p1 = drift.save_last_push("first", "DOC_ATOMIC", tmp_path)
+    # Overwrite — temp file must be cleaned up by os.replace.
+    drift.save_last_push("second", "DOC_ATOMIC", tmp_path)
+    assert p1.read_text(encoding="utf-8") == "second"
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == []

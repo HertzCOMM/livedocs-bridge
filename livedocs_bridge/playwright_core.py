@@ -370,11 +370,11 @@ async def backup_doc(
 
     if plain:
         txt_path = base.with_suffix(".txt")
-        txt_path.write_text(plain, encoding="utf-8")
+        drift_mod.atomic_write_text(txt_path, plain)
         result["txt"] = txt_path
     if html:
         html_path = base.with_suffix(".html")
-        html_path.write_text(html, encoding="utf-8")
+        drift_mod.atomic_write_text(html_path, html)
         result["html"] = html_path
 
     if result["txt"] or result["html"]:

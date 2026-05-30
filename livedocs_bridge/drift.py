@@ -22,15 +22,22 @@ which gets purged on macOS reboot). 30-day rotation is built in; the
 from __future__ import annotations
 
 import difflib
+import hashlib
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional
 
-DOC_ID_TRUNC = 16
 DEFAULT_KEEP_DAYS = 30
 LAST_PUSH_PREFIX = "_last_pushed_"
 BACKUP_PREFIX = "doc_backup_"
+
+# Google Doc IDs are URL-safe base64 (`A-Za-z0-9_-`) and ~44 chars in practice.
+# Anything outside this charset is either a corrupted URL or hostile input;
+# we hash it down to a fixed-length safe key instead of writing it to disk.
+_DOC_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_HASH_FALLBACK_LEN = 32  # SHA-256 hex truncated for filename brevity
 
 
 def default_backup_dir() -> Path:
@@ -60,19 +67,36 @@ def extract_doc_id(url: str) -> Optional[str]:
         return None
 
 
-def doc_id_for_baseline(url_or_id: str) -> str:
-    """Return the canonical identifier used in `_last_pushed_<id>.txt`.
+def safe_doc_key(url_or_id: Optional[str]) -> str:
+    """Return a filesystem-safe key for `url_or_id`.
 
-    Accepts either a full Doc URL or a bare id. Full ids are kept verbatim
-    so baselines round-trip across sessions; the truncation only applies to
-    timestamped backups (to keep filenames short on Windows).
+    - Extracts the Doc id from a full URL if possible.
+    - Returns the id verbatim when it matches `[A-Za-z0-9_-]{1,128}` (the only
+      shape Google actually issues).
+    - Otherwise returns `h_<sha256_hex[:32]>` so crafted inputs (with `/`, `..`,
+      or other path separators) cannot escape the backup directory.
+
+    The same key is used for both baselines and timestamped backups; the prior
+    16-char truncation has been removed because two distinct Docs can share a
+    16-char prefix, which led to cross-doc backup collisions (codex audit
+    finding CRITICAL #1).
     """
+    if not url_or_id:
+        return "unknown"
     extracted = extract_doc_id(url_or_id) or url_or_id
-    return extracted
+    if _DOC_ID_RE.fullmatch(extracted):
+        return extracted
+    digest = hashlib.sha256(extracted.encode("utf-8")).hexdigest()
+    return f"h_{digest[:_HASH_FALLBACK_LEN]}"
+
+
+# Back-compat shims for any external callers still using the v0.3.0 names.
+def doc_id_for_baseline(url_or_id: str) -> str:
+    return safe_doc_key(url_or_id)
 
 
 def doc_id_for_backup(url_or_id: str) -> str:
-    return doc_id_for_baseline(url_or_id)[:DOC_ID_TRUNC] or "unknown"
+    return safe_doc_key(url_or_id)
 
 
 def backup_base_path(
@@ -80,17 +104,29 @@ def backup_base_path(
     doc_url_or_id: str,
     timestamp: Optional[str] = None,
 ) -> Path:
-    """Compute the `doc_backup_<ts>_<short_id>` path (no suffix)."""
+    """Compute the `doc_backup_<ts>_<safe_id>` path (no suffix)."""
     ts = timestamp or time.strftime("%Y%m%d_%H%M%S")
-    short = doc_id_for_backup(doc_url_or_id)
+    key = safe_doc_key(doc_url_or_id)
     backup_dir.mkdir(parents=True, exist_ok=True)
-    return backup_dir / f"{BACKUP_PREFIX}{ts}_{short}"
+    return backup_dir / f"{BACKUP_PREFIX}{ts}_{key}"
 
 
 def last_push_path(backup_dir: Path, doc_url_or_id: str) -> Path:
-    """Path to `_last_pushed_<full_doc_id>.txt`."""
-    full_id = doc_id_for_baseline(doc_url_or_id) or "unknown"
-    return backup_dir / f"{LAST_PUSH_PREFIX}{full_id}.txt"
+    """Path to `_last_pushed_<safe_doc_id>.txt`."""
+    key = safe_doc_key(doc_url_or_id)
+    return backup_dir / f"{LAST_PUSH_PREFIX}{key}.txt"
+
+
+def atomic_write_text(path: Path, data: str) -> None:
+    """Write `data` to `path` atomically via temp + rename.
+
+    Prevents truncated baseline / backup files when the process dies mid-write
+    (codex audit finding HIGH #3).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(data, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def save_last_push(
@@ -98,11 +134,11 @@ def save_last_push(
     doc_url_or_id: str,
     backup_dir: Optional[Path | str] = None,
 ) -> Path:
-    """Persist `text` as the next drift baseline for this Doc."""
+    """Persist `text` as the next drift baseline for this Doc (atomic)."""
     root = resolve_backup_dir(backup_dir)
     root.mkdir(parents=True, exist_ok=True)
     path = last_push_path(root, doc_url_or_id)
-    path.write_text(text, encoding="utf-8")
+    atomic_write_text(path, text)
     return path
 
 
@@ -180,20 +216,24 @@ def list_backups(
     """Return all backups for a Doc, newest first.
 
     Each entry: {"timestamp": str, "txt": Path|None, "html": Path|None, "mtime": float}.
+
+    Filters by the full safe doc key (post v0.3.1). The pre-v0.3.1 16-char
+    truncation has been removed — two distinct Docs can no longer collide.
     """
     root = resolve_backup_dir(backup_dir)
     if not root.exists():
         return []
-    short = doc_id_for_backup(doc_url_or_id)
+    key = safe_doc_key(doc_url_or_id)
+    suffix_marker = f"_{key}"
     grouped: dict[str, dict] = {}
     for f in root.iterdir():
         if not f.is_file() or not f.name.startswith(BACKUP_PREFIX):
             continue
-        if not f.stem.endswith(f"_{short}"):
+        if not f.stem.endswith(suffix_marker):
             continue
-        # Strip prefix + trailing _<short>; what remains is the timestamp.
+        # Strip prefix + trailing _<key>; what remains is the timestamp.
         stem = f.stem
-        ts = stem[len(BACKUP_PREFIX) : -(len(short) + 1)]
+        ts = stem[len(BACKUP_PREFIX) : -len(suffix_marker)]
         entry = grouped.setdefault(
             ts, {"timestamp": ts, "txt": None, "html": None, "mtime": 0.0}
         )

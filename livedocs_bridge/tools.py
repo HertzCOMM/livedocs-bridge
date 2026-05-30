@@ -99,7 +99,18 @@ async def docs_replace_all(
         content_type: 'markdown' (default) or 'html'.
         doc_url: pin to this Doc id. RECOMMENDED — without it we fall back to
             the first matching tab, which can be the wrong Doc.
-        force: bypass drift abort. The Doc is still backed up before clearing.
+        force: bypass drift abort AND bypass the fail-closed guard when the
+            pre-op clipboard capture fails. Still backed up before clearing.
+
+    Failure-mode contract (codex audit v0.3.1):
+      - Pre-op clipboard read failure (no `.txt` snapshot, no plain capture):
+        abort unless `force=True`. We refuse to fly blind on a destructive op.
+      - Drift detected vs `_last_pushed_<id>.txt`: abort unless `force=True`.
+      - Second-stage drift check (between snapshot and clear) detects another
+        edit landing in the TOCTOU window: abort unless `force=True`.
+      - paste_html failure after a successful clear_doc: response carries
+        `doc_may_be_empty=True` + `recommended_next_action` pointing at
+        docs_restore_from_backup.
     """
     try:
         html, _ = _resolve_content(content, content_type)
@@ -117,13 +128,31 @@ async def docs_replace_all(
             editor = await get_docs_editor(page)
 
             backup = await backup_doc(editor, backup_dir, doc_url_or_id=doc_url or page.url)
-            doc_id = backup.get("doc_id") or drift_mod.extract_doc_id(page.url) or "unknown"
+            doc_id = drift_mod.safe_doc_key(doc_url or page.url)
             current_plain = ""
             if backup.get("txt"):
                 try:
                     current_plain = backup["txt"].read_text(encoding="utf-8")
                 except OSError:
                     current_plain = ""
+
+            # HIGH #2: fail-closed when the pre-op capture didn't produce any
+            # ground truth. Either text or html is enough to call it a real
+            # snapshot; both missing means we can't honestly drift-check.
+            capture_failed = not backup.get("txt") and not backup.get("html")
+            if capture_failed and not force:
+                return _err(
+                    "pre-op Doc capture failed; refusing destructive replace without force=True",
+                    doc_url=page.url,
+                    capture_failed=True,
+                    capture_error=backup.get("error"),
+                    backup_paths=_paths_dict(backup),
+                    recommended_next_action=(
+                        "verify Chrome has focus + clipboard permission for "
+                        "docs.google.com, then retry; pass force=True only if "
+                        "you accept that the prior Doc state is unrecoverable"
+                    ),
+                )
 
             drifted, diff = drift_mod.check_drift(current_plain, doc_id, backup_dir)
             if drifted and not force:
@@ -135,13 +164,37 @@ async def docs_replace_all(
                     backup_paths=_paths_dict(backup),
                 )
 
+            # HIGH #4: close the TOCTOU window between the snapshot above and
+            # the clear_doc below. If the user landed an edit during this
+            # interval, the recapture will diverge from `current_plain` and we
+            # abort. Cheap compared to the destructive op we're about to run.
+            recapture_diverged = False
+            recapture_summary = ""
+            try:
+                recapture = await capture_doc_plain(editor)
+                if (recapture or "").strip() != (current_plain or "").strip():
+                    recapture_diverged = True
+                    recapture_summary = _short_diff(current_plain, recapture)
+            except Exception as e:  # noqa: BLE001 — diagnostic only
+                log.warning("pre-clear recapture failed: %s", e)
+            if recapture_diverged and not force:
+                return _err(
+                    "Doc changed between snapshot and clear; refusing to overwrite without force=True.",
+                    doc_url=page.url,
+                    toctou_detected=True,
+                    toctou_summary=recapture_summary,
+                    backup_paths=_paths_dict(backup),
+                )
+
             await clear_doc(editor)
             status = await paste_html(editor, html)
             if not status.startswith("CLIP_OK"):
                 return _err(
-                    f"clipboard write failed: {status}",
+                    f"clipboard write failed after clear: {status}",
                     doc_url=page.url,
                     backup_paths=_paths_dict(backup),
+                    doc_may_be_empty=True,
+                    recommended_next_action="docs_restore_from_backup",
                 )
 
             new_plain = await capture_doc_plain(editor)
@@ -153,15 +206,37 @@ async def docs_replace_all(
                     "html_bytes": len(html),
                     "drift_detected": drifted,
                     "drift_summary": diff if drifted else "",
+                    "toctou_detected": recapture_diverged,
+                    "capture_failed": capture_failed,
                     "backup_paths": _paths_dict(backup),
                     "baseline_saved": True,
                     "baseline_path": str(baseline_path),
-                    "forced": bool(drifted and force),
+                    "forced": bool(force and (drifted or capture_failed or recapture_diverged)),
                 }
             )
     except Exception as e:
         log.exception("docs_replace_all failed")
         return _err(str(e))
+
+
+def _short_diff(before: str, after: str, max_lines: int = 40) -> str:
+    """Compact unified diff for surfacing TOCTOU divergence in tool responses."""
+    import difflib
+
+    lines = list(
+        difflib.unified_diff(
+            (before or "").splitlines(),
+            (after or "").splitlines(),
+            fromfile="snapshot",
+            tofile="recapture",
+            lineterm="",
+            n=2,
+        )
+    )
+    summary = "\n".join(lines[:max_lines])
+    if len(lines) > max_lines:
+        summary += f"\n... ({len(lines) - max_lines} more diff lines truncated)"
+    return summary
 
 
 async def docs_append(
@@ -327,6 +402,14 @@ async def docs_get_state() -> dict[str, Any]:
 async def docs_check_drift(doc_url: Optional[str] = None) -> dict[str, Any]:
     """Preview whether the Doc has changed since our last push.
 
+    ⚠ SIDE EFFECTS — this is "preview" semantically but not technically free:
+      - Focuses the Doc tab (`page.bring_to_front()`).
+      - Runs Cmd+A so the user's prior selection is replaced with "select all".
+      - Runs Cmd+C so the user's clipboard is overwritten with the Doc body.
+    There is no canvas-internals API to read Doc text without round-tripping
+    through the clipboard, so this cost is unavoidable today. The response
+    carries `clipboard_overwritten=true` so callers can warn the user.
+
     Use this before `docs_replace_all` if you want to surface the diff to the
     user instead of blindly calling replace and getting an error.
     """
@@ -337,9 +420,7 @@ async def docs_check_drift(doc_url: Optional[str] = None) -> dict[str, Any]:
             page = await find_or_open_doc(session, doc_url)
             editor = await get_docs_editor(page)
             current_plain = await capture_doc_plain(editor)
-            doc_id = (
-                drift_mod.extract_doc_id(doc_url) if doc_url else None
-            ) or drift_mod.extract_doc_id(page.url) or "unknown"
+            doc_id = drift_mod.safe_doc_key(doc_url or page.url)
             baseline_path = drift_mod.last_push_path(backup_dir, doc_id)
             drifted, diff = drift_mod.check_drift(current_plain, doc_id, backup_dir)
             return _ok(
@@ -350,6 +431,8 @@ async def docs_check_drift(doc_url: Optional[str] = None) -> dict[str, Any]:
                     "drift_summary": diff,
                     "baseline_exists": baseline_path.exists(),
                     "baseline_path": str(baseline_path) if baseline_path.exists() else None,
+                    "clipboard_overwritten": True,
+                    "selection_changed": True,
                 }
             )
     except Exception as e:
@@ -411,9 +494,7 @@ async def docs_restore_from_backup(
                 await insert_text(editor, txt_path.read_text(encoding="utf-8"))
 
             new_plain = await capture_doc_plain(editor)
-            doc_id = (
-                drift_mod.extract_doc_id(doc_id_lookup) or "unknown"
-            )
+            doc_id = drift_mod.safe_doc_key(doc_id_lookup)
             baseline_path = drift_mod.save_last_push(new_plain, doc_id, backup_dir)
             return _ok(
                 {

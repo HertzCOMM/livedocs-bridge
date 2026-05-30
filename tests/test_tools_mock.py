@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -37,15 +38,22 @@ def _patch_common(
     title="Untitled",
     pre_text: str = "",
     post_text: str = "post-paste content",
+    recapture_text: Optional[str] = None,
+    backup_capture_failed: bool = False,
 ):
     """Set up a fake browser + drift backup dir under tmp_path.
 
-    `pre_text` is what backup_doc reads (i.e. the Doc's pre-clear state).
-    `post_text` is what capture_doc_plain returns after the paste.
+    Args:
+        pre_text: what backup_doc reads (i.e. the Doc's pre-clear state).
+        post_text: what capture_doc_plain returns AFTER the paste.
+        recapture_text: when set, simulates a TOCTOU divergence — the
+            pre-clear recapture returns this text instead of `pre_text`.
+        backup_capture_failed: when True, the fake `backup_doc` returns no
+            txt/html (simulating a clipboard read failure).
     """
     page = _FakePage()
     backup_dir = tmp_path / "backups"
-    backup_dir.mkdir()
+    backup_dir.mkdir(exist_ok=True)
     monkeypatch.setattr(drift_mod, "default_backup_dir", lambda: backup_dir)
 
     monkeypatch.setattr(tools, "BrowserSession", lambda *a, **k: _fake_session())
@@ -58,15 +66,32 @@ def _patch_common(
     monkeypatch.setattr(tools, "get_doc_title", AsyncMock(return_value=title))
     monkeypatch.setattr(tools, "get_doc_text", AsyncMock(return_value="hello world"))
     monkeypatch.setattr(tools, "scroll_doc", AsyncMock())
-    monkeypatch.setattr(tools, "capture_doc_plain", AsyncMock(return_value=post_text))
+
+    # capture_doc_plain is called twice during docs_replace_all:
+    #   1) pre-clear recapture (TOCTOU check) — should match pre_text unless
+    #      `recapture_text` overrides;
+    #   2) post-paste baseline — should be post_text.
+    recapture_value = recapture_text if recapture_text is not None else pre_text
+    capture_returns = [recapture_value, post_text]
+    capture_mock = AsyncMock(side_effect=capture_returns)
+    monkeypatch.setattr(tools, "capture_doc_plain", capture_mock)
 
     async def fake_backup(editor, dirpath, doc_url_or_id=None):
         target = doc_url_or_id or page.url
+        if backup_capture_failed:
+            return {
+                "txt": None,
+                "html": None,
+                "doc_url": page.url,
+                "doc_id": drift_mod.extract_doc_id(target),
+                "warning": None,
+                "error": "clipboard.read failed: NotAllowedError",
+            }
         base = drift_mod.backup_base_path(Path(dirpath), target)
         txt_path = base.with_suffix(".txt")
-        txt_path.write_text(pre_text, encoding="utf-8")
+        drift_mod.atomic_write_text(txt_path, pre_text)
         html_path = base.with_suffix(".html")
-        html_path.write_text(f"<div>{pre_text}</div>", encoding="utf-8")
+        drift_mod.atomic_write_text(html_path, f"<div>{pre_text}</div>")
         return {
             "txt": txt_path,
             "html": html_path,
@@ -195,7 +220,12 @@ async def test_docs_check_drift_detects_diff(monkeypatch, tmp_path):
 
 
 async def test_docs_restore_from_backup_uses_latest(monkeypatch, tmp_path):
-    page, backup_dir = _patch_common(monkeypatch, tmp_path, post_text="restored")
+    page, backup_dir = _patch_common(monkeypatch, tmp_path)
+    # restore calls capture_doc_plain exactly once (post-restore baseline);
+    # override the multi-shot mock from _patch_common with a fixed return.
+    monkeypatch.setattr(
+        tools, "capture_doc_plain", AsyncMock(return_value="restored")
+    )
     doc_id = drift_mod.extract_doc_id(page.url)
     base = drift_mod.backup_base_path(backup_dir, doc_id, timestamp="20260101_000000")
     base.with_suffix(".txt").write_text("backup text", encoding="utf-8")
@@ -244,3 +274,137 @@ def test_resolve_content_markdown_to_html():
 def test_resolve_content_rejects_unknown():
     with pytest.raises(ValueError):
         tools._resolve_content("x", "pdf")
+
+
+# -----------------------------------------------------------------------------
+# v0.3.1 — codex audit regressions
+# -----------------------------------------------------------------------------
+
+
+async def test_replace_all_fails_closed_on_capture_failure(monkeypatch, tmp_path):
+    # HIGH #2: pre-op clipboard read failure must abort destructive replace
+    # unless the caller explicitly passes force=True.
+    _patch_common(monkeypatch, tmp_path, backup_capture_failed=True)
+    res = await tools.docs_replace_all("# x", "markdown")
+    assert res["success"] is False
+    assert res["capture_failed"] is True
+    assert "force=True" in res["error"]
+    tools.clear_doc.assert_not_awaited()  # type: ignore[attr-defined]
+    tools.paste_html.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+async def test_replace_all_capture_failure_force_proceeds(monkeypatch, tmp_path):
+    # force=True must override the capture-failure abort but surface the flag.
+    page, _ = _patch_common(
+        monkeypatch, tmp_path, backup_capture_failed=True, post_text="new"
+    )
+    res = await tools.docs_replace_all("# x", "markdown", force=True)
+    assert res["success"] is True
+    assert res["capture_failed"] is True
+    assert res["forced"] is True
+
+
+async def test_replace_all_detects_toctou_between_snapshot_and_clear(
+    monkeypatch, tmp_path
+):
+    # HIGH #4: between backup_doc and clear_doc, the user landed an edit.
+    # The pre-clear recapture diverges from the snapshot — abort.
+    page, backup_dir = _patch_common(
+        monkeypatch,
+        tmp_path,
+        pre_text="snapshot says A",
+        recapture_text="user just edited to B",
+    )
+    res = await tools.docs_replace_all("# x", "markdown")
+    assert res["success"] is False
+    assert res["toctou_detected"] is True
+    assert "toctou_summary" in res and res["toctou_summary"]
+    tools.clear_doc.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+async def test_replace_all_toctou_force_proceeds(monkeypatch, tmp_path):
+    _patch_common(
+        monkeypatch,
+        tmp_path,
+        pre_text="snapshot A",
+        recapture_text="diverged B",
+        post_text="new content",
+    )
+    res = await tools.docs_replace_all("# x", "markdown", force=True)
+    assert res["success"] is True
+    assert res["toctou_detected"] is True
+    assert res["forced"] is True
+
+
+async def test_replace_all_post_clear_paste_failure_surfaces_recovery(
+    monkeypatch, tmp_path
+):
+    # LOW #8: when paste_html fails after clear_doc has already wiped the
+    # Doc, the response must shout "RESTORE FROM BACKUP" — not just return
+    # a generic clipboard error.
+    _patch_common(
+        monkeypatch,
+        tmp_path,
+        paste_status="CLIP_ERR NotAllowedError: focus lost",
+    )
+    res = await tools.docs_replace_all("# x", "markdown")
+    assert res["success"] is False
+    assert res["doc_may_be_empty"] is True
+    assert res["recommended_next_action"] == "docs_restore_from_backup"
+    assert res["backup_paths"]["html"] is not None
+
+
+async def test_check_drift_advertises_clipboard_side_effects(monkeypatch, tmp_path):
+    # MEDIUM #6: docs_check_drift must declare it overwrites the clipboard
+    # and changes the selection so callers can warn the user.
+    _patch_common(monkeypatch, tmp_path, post_text="current text")
+    res = await tools.docs_check_drift()
+    assert res["success"] is True
+    assert res["clipboard_overwritten"] is True
+    assert res["selection_changed"] is True
+
+
+async def test_replace_all_uses_safe_doc_key_for_baseline(monkeypatch, tmp_path):
+    # CRITICAL #1 regression: distinct doc ids sharing a 16-char prefix must
+    # produce distinct baseline files. Pre-v0.3.1 they collided.
+    pin_a = "https://docs.google.com/document/d/AAAAAAAAAAAAAAAA_first/edit"
+    pin_b = "https://docs.google.com/document/d/AAAAAAAAAAAAAAAA_second/edit"
+
+    page_a, backup_dir = _patch_common(monkeypatch, tmp_path, post_text="A content")
+    page_a.url = pin_a
+    await tools.docs_replace_all("# a", "markdown", doc_url=pin_a)
+
+    page_b, _ = _patch_common(monkeypatch, tmp_path, post_text="B content")
+    page_b.url = pin_b
+    await tools.docs_replace_all("# b", "markdown", doc_url=pin_b)
+
+    baseline_a = drift_mod.last_push_path(backup_dir, pin_a)
+    baseline_b = drift_mod.last_push_path(backup_dir, pin_b)
+    assert baseline_a != baseline_b
+    assert baseline_a.read_text() == "A content"
+    assert baseline_b.read_text() == "B content"
+
+
+async def test_replace_all_hostile_doc_id_does_not_escape_backup_dir(
+    monkeypatch, tmp_path
+):
+    # MEDIUM #5 regression: a crafted doc URL must not be able to write a
+    # baseline outside the backup directory.
+    page, backup_dir = _patch_common(monkeypatch, tmp_path, post_text="content")
+    hostile = "https://docs.google.com/document/d/../../../../etc/passwd_pwn/edit"
+    page.url = hostile
+    res = await tools.docs_replace_all("# x", "markdown", doc_url=hostile)
+    assert res["success"] is True
+    baseline_path = Path(res["baseline_path"])
+    # The path must stay inside backup_dir, regardless of the hostile input.
+    assert baseline_dir_ancestor(backup_dir, baseline_path)
+    # Filename should be the hashed fallback (`_last_pushed_h_<32hex>.txt`).
+    assert baseline_path.name.startswith("_last_pushed_h_")
+
+
+def baseline_dir_ancestor(parent: Path, child: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False

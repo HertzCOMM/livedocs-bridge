@@ -5,6 +5,61 @@ All notable changes to `livedocs-bridge` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-05-31
+
+Codex adversarial audit (gpt-5.3-codex) on the v0.3.0 diff surfaced 1 CRITICAL,
+3 HIGH, 2 MEDIUM, 2 LOW. All except the prune-future-mtime and contexts[0]
+items are fixed here. v0.3.0 should be considered superseded.
+
+### Fixed
+
+- **[CRITICAL] Cross-Doc backup collision.** v0.3.0 truncated the Google Doc id
+  to 16 chars when naming `doc_backup_*` files. Two distinct Docs sharing a
+  16-char prefix collided, and `docs_restore_from_backup` could pick the
+  *other* Doc's backup and overwrite the current Doc with it. The truncation
+  is gone — both baseline and timestamped backups now use the full safe id.
+- **[HIGH] Pre-op capture failure fail-open.** If the pre-op clipboard read
+  failed silently (focus lost, permission revoked), `current_plain` became
+  `""`, drift compared to an empty baseline as "no drift", and a destructive
+  replace proceeded without a trustworthy snapshot. `docs_replace_all` now
+  fails closed with `capture_failed: true` unless the caller passes
+  `force=True`.
+- **[HIGH] Non-atomic baseline writes.** `_last_pushed_*` and `doc_backup_*`
+  files were written with plain `Path.write_text`. A crash mid-write left
+  truncated content that the next drift check would silently mistake for the
+  prior baseline. All baseline + backup writes now go through temp file +
+  `os.replace`.
+- **[HIGH] TOCTOU window between snapshot and clear.** `docs_replace_all`
+  now does a second clipboard recapture immediately before `clear_doc`. If
+  the user landed an edit in the meantime, the call aborts with
+  `toctou_detected: true` unless `force=True`.
+- **[MEDIUM] Path traversal via crafted `doc_url`.** Doc ids that didn't
+  match `[A-Za-z0-9_-]{1,128}` were written into the filename verbatim,
+  including `/` and `..`. They are now hashed to `h_<sha256[:32]>` so the
+  baseline / backup path always stays inside the backup directory.
+- **[MEDIUM] `docs_check_drift` undeclared side effects.** The tool runs
+  Cmd+A + Cmd+C, which changes selection and overwrites the clipboard with
+  the Doc body. The docstring now says so loudly and the response includes
+  `clipboard_overwritten: true` + `selection_changed: true`.
+- **[LOW] Silent data-loss exposure on post-clear paste failure.** When
+  `paste_html` failed after `clear_doc` already wiped the Doc, the response
+  carried a generic clipboard error. It now sets `doc_may_be_empty: true`
+  and `recommended_next_action: "docs_restore_from_backup"`.
+
+### Added
+
+- `drift.safe_doc_key(url_or_id)` — canonical id sanitizer used everywhere.
+- `drift.atomic_write_text(path, data)` — temp + `os.replace` helper.
+- 17 new regression tests, one per audit finding (87 total).
+
+### Acknowledged but not fixed in v0.3.1
+
+- **[LOW] Future-dated `doc_backup_*` files never prune.** Acceptable risk
+  for single-user installs; will revisit if anyone reports it.
+- **`contexts[0]` bias.** Multi-context Chrome attach picks the first
+  context only. Same single-user assumption; v0.4 candidate alongside
+  multi-tab routing.
+
 ## [0.3.0] - 2026-05-31
 
 Production hardening driven by an 8-hour, 20-iteration real workflow (HertzFlow
