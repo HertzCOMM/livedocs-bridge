@@ -357,11 +357,13 @@ async def test_replace_all_post_clear_paste_failure_surfaces_recovery(
 async def test_check_drift_advertises_clipboard_side_effects(monkeypatch, tmp_path):
     # MEDIUM #6: docs_check_drift must declare it overwrites the clipboard
     # and changes the selection so callers can warn the user.
+    # v0.3.2 also declares tab_focus_changed (verification audit residual).
     _patch_common(monkeypatch, tmp_path, post_text="current text")
     res = await tools.docs_check_drift()
     assert res["success"] is True
     assert res["clipboard_overwritten"] is True
     assert res["selection_changed"] is True
+    assert res["tab_focus_changed"] is True
 
 
 async def test_replace_all_uses_safe_doc_key_for_baseline(monkeypatch, tmp_path):

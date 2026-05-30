@@ -111,6 +111,12 @@ async def docs_replace_all(
       - paste_html failure after a successful clear_doc: response carries
         `doc_may_be_empty=True` + `recommended_next_action` pointing at
         docs_restore_from_backup.
+
+    Known residual (v0.3.2): a sub-millisecond race window remains between
+    the pre-clear recapture and the `Cmd+A + Backspace` keystrokes landing.
+    Closing it would require locking the user out of the tab (we don't), so
+    keystroke-level edits in that window can still be silently consumed. The
+    `_last_pushed_*` baseline + persistent backup remain the recovery path.
     """
     try:
         html, _ = _resolve_content(content, content_type)
@@ -403,12 +409,14 @@ async def docs_check_drift(doc_url: Optional[str] = None) -> dict[str, Any]:
     """Preview whether the Doc has changed since our last push.
 
     ⚠ SIDE EFFECTS — this is "preview" semantically but not technically free:
-      - Focuses the Doc tab (`page.bring_to_front()`).
+      - Brings the Doc tab to the front (`page.bring_to_front()`); this can
+        steal focus from the user's current window.
       - Runs Cmd+A so the user's prior selection is replaced with "select all".
       - Runs Cmd+C so the user's clipboard is overwritten with the Doc body.
     There is no canvas-internals API to read Doc text without round-tripping
     through the clipboard, so this cost is unavoidable today. The response
-    carries `clipboard_overwritten=true` so callers can warn the user.
+    carries `clipboard_overwritten` + `selection_changed` + `tab_focus_changed`
+    so callers can warn the user explicitly.
 
     Use this before `docs_replace_all` if you want to surface the diff to the
     user instead of blindly calling replace and getting an error.
@@ -433,6 +441,7 @@ async def docs_check_drift(doc_url: Optional[str] = None) -> dict[str, Any]:
                     "baseline_path": str(baseline_path) if baseline_path.exists() else None,
                     "clipboard_overwritten": True,
                     "selection_changed": True,
+                    "tab_focus_changed": True,
                 }
             )
     except Exception as e:

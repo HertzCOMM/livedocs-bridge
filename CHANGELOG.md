@@ -5,6 +5,42 @@ All notable changes to `livedocs-bridge` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-05-31
+
+Verification audit (gpt-5.3-codex) on the v0.3.0 → v0.3.1 diff confirmed all
+v0.3.0 CRITICAL/HIGH findings are closed and no new CRITICAL/HIGH was
+introduced. Three "partial" closures called out by the verifier are addressed
+here.
+
+### Fixed
+
+- **Atomic write tmp filename collision.** v0.3.1's `atomic_write_text` used
+  a deterministic `<target>.tmp` name. Two concurrent writers to the same
+  baseline file could clobber each other's temp file mid-flight. v0.3.2 uses
+  `tempfile.mkstemp(prefix=".<name>.", suffix=".tmp", dir=parent)` so every
+  writer gets its own randomized tmp basename. Cleanup is in a `try/except`
+  that unlinks the tmp on failure so a crashed write doesn't leak.
+- **`docs_check_drift` undeclared focus side effect.** v0.3.1 surfaced
+  `clipboard_overwritten` + `selection_changed` but not the fact that
+  `page.bring_to_front()` can steal focus from the user's foreground
+  window. Response now also includes `tab_focus_changed: true`, and the
+  docstring lists all three side effects explicitly.
+
+### Documented
+
+- **TOCTOU residual in `docs_replace_all`.** The pre-clear recapture closes
+  the snapshot-to-recapture window but a sub-millisecond keystroke window
+  remains between recapture and `Cmd+A + Backspace` landing. Closing it
+  would require locking the user out of the tab. The docstring now states
+  this residual explicitly; the persistent backup + baseline remain the
+  recovery path.
+
+### Acknowledged
+
+- `_short_diff` exposes up to 40 diff lines of Doc content in
+  `toctou_summary`. Same class of content exposure as `drift_summary` in
+  v0.3.0; verifier rated it informational, not a severity escalation.
+
 ## [0.3.1] - 2026-05-31
 
 Codex adversarial audit (gpt-5.3-codex) on the v0.3.0 diff surfaced 1 CRITICAL,

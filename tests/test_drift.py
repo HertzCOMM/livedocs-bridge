@@ -212,3 +212,46 @@ def test_save_last_push_is_atomic(tmp_path):
     assert p1.read_text(encoding="utf-8") == "second"
     leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
     assert leftovers == []
+
+
+def test_atomic_write_uses_unique_tmp_filename(tmp_path, monkeypatch):
+    # v0.3.2: deterministic `<target>.tmp` was a write race. mkstemp gives
+    # every writer its own tmp basename, so concurrent writers can't clobber
+    # each other's temp file mid-flight. We assert two things:
+    #   1. The tmp filename includes random bytes (not a fixed `.tmp` suffix
+    #      next to the target).
+    #   2. Repeated writes still end up at the target and leave no stragglers.
+    target = tmp_path / "_last_pushed_race.txt"
+
+    captured_tmp_names: list[str] = []
+    real_mkstemp = drift.tempfile.mkstemp
+
+    def spy(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        captured_tmp_names.append(Path(name).name)
+        return fd, name
+
+    monkeypatch.setattr(drift.tempfile, "mkstemp", spy)
+
+    for i in range(5):
+        drift.atomic_write_text(target, f"v{i}")
+    assert target.read_text(encoding="utf-8") == "v4"
+    # All tmp basenames must differ — deterministic `<target>.tmp` would
+    # produce the same string each time.
+    assert len(set(captured_tmp_names)) == len(captured_tmp_names)
+    # No tmp leftovers post-write.
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == []
+
+
+def test_atomic_write_cleans_tmp_on_failure(tmp_path, monkeypatch):
+    target = tmp_path / "destination.txt"
+
+    def boom(*a, **k):
+        raise RuntimeError("simulated replace failure")
+
+    monkeypatch.setattr(drift.os, "replace", boom)
+    with pytest.raises(RuntimeError):
+        drift.atomic_write_text(target, "data")
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == []

@@ -25,6 +25,7 @@ import difflib
 import hashlib
 import os
 import re
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -122,11 +123,26 @@ def atomic_write_text(path: Path, data: str) -> None:
 
     Prevents truncated baseline / backup files when the process dies mid-write
     (codex audit finding HIGH #3).
+
+    v0.3.2: the temp file name is randomized via `tempfile.mkstemp` so two
+    concurrent writers to the same target can't clobber each other's temp
+    file mid-flight (verification audit partial → fully closed).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(data, encoding="utf-8")
-    os.replace(tmp, path)
+    fd, tmp_str = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    tmp = Path(tmp_str)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def save_last_push(
