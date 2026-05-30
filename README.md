@@ -230,11 +230,13 @@ unchanged. No browser tab popped, no permission prompt, no API key.
 | Name | Signature | Purpose |
 | --- | --- | --- |
 | `docs_open` | `(url: str)` | Open or focus a Doc tab. `docs.new` creates a fresh Doc. |
-| `docs_replace_all` | `(content: str, content_type: 'markdown' \| 'html' = 'markdown')` | Wipe the Doc and inject new content. |
-| `docs_append` | `(content: str, content_type = 'markdown')` | Append to the end of the Doc. |
-| `docs_find_replace` | `(find: str, replace: str, all_occurrences: bool = True)` | Replace via the Docs Find & Replace dialog. |
-| `docs_screenshot` | `(scroll_to: 'top' \| 'bottom' \| 'current' = 'top', path: str \| None = None)` | Capture viewport as PNG (path or base64). |
+| `docs_replace_all` | `(content, content_type='markdown', doc_url=None, force=False)` | Wipe + inject. Drift-checked + auto-backup. Pass `doc_url` to pin a specific Doc. `force=True` overrides drift abort. |
+| `docs_append` | `(content, content_type='markdown', doc_url=None)` | Append. Snapshots the Doc first. |
+| `docs_find_replace` | `(find, replace, all_occurrences=True)` | Replace via the Docs Find & Replace dialog. |
+| `docs_screenshot` | `(scroll_to='top', path=None)` | Capture viewport as PNG (path or base64). |
 | `docs_get_state` | `()` | Doc URL, title, char count, observed-at timestamp. |
+| `docs_check_drift` | `(doc_url=None)` | Preview drift without writing. Returns `{drifted, drift_summary, baseline_exists}`. |
+| `docs_restore_from_backup` | `(doc_url=None, backup_timestamp=None)` | Restore the Doc from the latest (or a specific) auto-backup. Snapshots the pre-restore state first. |
 
 All tools return `{"success": bool, ...}` so MCP clients can branch on the result
 instead of catching exceptions.
@@ -254,11 +256,38 @@ so LLMs can branch deterministically without parsing stderr.
 
 ---
 
+## Drift detection + backups
+
+Every `docs_replace_all` and `docs_append` snapshots the Doc to a persistent
+backup directory before clearing or appending. `docs_replace_all` additionally
+compares the current Doc against the last push baseline; if they don't match,
+the user has edited the Doc in the meantime and the call aborts with the diff
+unless you pass `force=True`.
+
+```
+~/.livedocs-bridge/backups/
+├── _last_pushed_<doc_id>.txt              # baseline, never pruned
+├── doc_backup_<YYYYMMDD_HHMMSS>_<short>.txt
+├── doc_backup_<YYYYMMDD_HHMMSS>_<short>.html
+└── ... (anything older than 30d is auto-pruned on next write)
+```
+
+Override the location with `LIVEDOCS_BACKUP_DIR=/abs/path`. Recommended
+workflow when you're orchestrating writes from an agent:
+
+1. Call `docs_check_drift(doc_url=...)` and show the diff if `drifted` is true.
+2. Ask the user whether to proceed.
+3. Call `docs_replace_all(..., doc_url=..., force=True)` if approved.
+4. If the result looks wrong, call
+   `docs_restore_from_backup(doc_url=...)` to roll back to the
+   most recent pre-write snapshot.
+
 ## Environment variables
 
 | Name | Default | Notes |
 | --- | --- | --- |
 | `LIVEDOCS_CDP_URL` | `http://127.0.0.1:19825` | Chrome DevTools Protocol endpoint. |
+| `LIVEDOCS_BACKUP_DIR` | `~/.livedocs-bridge/backups` | Persistent backup root. |
 | `LIVEDOCS_LOG_LEVEL` | `INFO` | Python log level (`DEBUG` for verbose). |
 | `LIVEDOCS_LOG_FILE` | unset | If set, also write logs to this file. Stderr is always used. |
 
@@ -275,26 +304,75 @@ CDP-attached Chrome with a sample memo. Useful to sanity-check the install.
 
 ---
 
+## Production gotchas
+
+These are the failure modes a real 8-hour, 20-iteration workflow surfaced.
+Most of them are now handled inside the library; the last one is documented
+because no in-band fix is possible.
+
+1. **bb-browser MCP `browser_press` doesn't reach the Docs handler.** Docs
+   listens inside the nested `iframe.docs-texteventtarget-iframe`. A
+   page-level CDP `Input.dispatchKeyEvent` lands on the top frame and never
+   reaches Docs. We use Playwright `iframe.content_frame()` for frame-scoped
+   keyboard.
+2. **`navigator.clipboard.writeText` needs document focus.** Backgrounded
+   Chrome throws `Document is not focused`. We `context.grant_permissions`
+   + `page.bring_to_front()` + use `clipboard.write([new ClipboardItem({...})])`
+   (not `writeText`) so we can set both `text/html` and `text/plain`.
+3. **Paste HTML, not markdown.** Docs does NOT auto-render markdown on paste.
+   `## Heading` shows as literal text. We always convert markdown → HTML
+   with `markdown.markdown(text, extensions=['tables', 'fenced_code', 'nl2br'])`
+   before pasting.
+4. **`Cmd+Home` does NOT scroll Docs to top.** Use
+   `document.querySelector('.kix-appview-editor').scrollTop = 0` via
+   `page.evaluate(...)`.
+5. **`networkidle` never settles on Docs.** Docs polls continuously. We use
+   `wait_until="domcontentloaded"` for every `goto()` and `reload()`.
+6. **Idle Docs tabs lose their keystroke iframe.** If a tab has been idle for
+   tens of minutes, `iframe.docs-texteventtarget-iframe` may not be in the
+   DOM. We wait 45 s and reload the page once on timeout.
+7. **Wholesale replace is destructive.** Every `docs_replace_all` overwrites
+   anything the user typed since the last push. We always snapshot first and
+   compare against the last push baseline; the call aborts with the diff
+   unless `force=True`. See "Drift detection + backups" above.
+8. **`markdownify` HTML → markdown round-trip is lossy.** Docs emits inline
+   styles (`<span style="font-weight:700">`) that don't survive a markdown
+   round-trip. We never auto-pull-then-edit; drift detection compares plain
+   text only.
+9. **Don't smoke-test against your real Doc.** `livedocs-bridge self-test`
+   always opens a fresh `docs.new`. If you write your own smoke, do the same.
+10. **Chrome long-uptime can corrupt the browser-wide CDP session.** After
+    ~2 days of uptime, `connect_over_cdp` can hang at the protocol handshake
+    even though `http://.../json/version` still returns 200. There is no
+    in-band fix — kill Chrome and relaunch with
+    `livedocs-bridge launch-chrome` (or restart your bb-browser daemon if you
+    use one). `user-data-dir` is persistent, so your Google login survives.
+
 ## Limits & risks
 
-- **DOM brittleness.** We depend on the class name `docs-texteventtarget-iframe`
-  and `.kix-appview-editor`. If Google changes them, we update a selector.
-- **Single-tab routing.** v0.1 talks to the first matching Doc tab. Multi-tab
-  fan-out is a v0.2 feature.
+- **DOM brittleness.** We depend on the class names
+  `docs-texteventtarget-iframe` and `.kix-appview-editor`. If Google changes
+  them, we update a selector.
+- **Single-tab routing.** Pass `doc_url=` to pin a specific Doc; otherwise
+  we use the first matching Doc tab.
 - **ToS gray area.** Browser automation against Google Docs is not explicitly
   banned, but at very high frequencies it can trip anti-abuse heuristics. This
   is built for human-in-the-loop agent editing, not bulk farming.
 - **Chrome dependency.** Must be running with `--remote-debugging-port` and
-  logged in. The server doesn't launch or manage Chrome for you.
+  logged in. The server doesn't launch or manage Chrome for you (use
+  `livedocs-bridge launch-chrome` to spawn a managed instance).
 
 ---
 
 ## Roadmap
 
-- **v0.1** (now) — six core tools, Google Docs.
-- **v0.2** — multi-tab routing; Google Sheets and Slides (same canvas + iframe
-  architecture, different selectors).
-- **v0.3** — Notion and Coda (different DOM, same CDP attach pattern).
+- **v0.1** — six core tools, Google Docs.
+- **v0.2** — `install` / `doctor` / `self-test` CLI for LLM-driven setup.
+- **v0.3** (now) — drift detection + persistent backups + `doc_url` pinning
+  + iframe reload retry. Production hardening from real workflow.
+- **v0.4** — Google Sheets and Slides (same canvas + iframe architecture,
+  different selectors); multi-tab fan-out.
+- **v0.5** — Notion and Coda (different DOM, same CDP attach pattern).
 
 ---
 

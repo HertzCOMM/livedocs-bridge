@@ -58,15 +58,32 @@ async def docs_open(url: str) -> dict:
 
 
 @mcp.tool()
-async def docs_replace_all(content: str, content_type: str = "markdown") -> dict:
-    """Wholesale-replace the Doc body with `content` (markdown or html)."""
-    return await tools.docs_replace_all(content, content_type)
+async def docs_replace_all(
+    content: str,
+    content_type: str = "markdown",
+    doc_url: Optional[str] = None,
+    force: bool = False,
+) -> dict:
+    """Wholesale-replace the Doc body. Drift-protected + auto-backup.
+
+    Args:
+        content: Markdown or HTML payload.
+        content_type: 'markdown' (default, converted to HTML) or 'html'.
+        doc_url: Pin to this Doc id (RECOMMENDED). Without it, the first
+            matching Doc tab is used, which can be the wrong Doc.
+        force: Bypass drift abort. The Doc is still snapshotted before clearing.
+    """
+    return await tools.docs_replace_all(content, content_type, doc_url, force)
 
 
 @mcp.tool()
-async def docs_append(content: str, content_type: str = "markdown") -> dict:
-    """Append `content` to the end of the active Doc."""
-    return await tools.docs_append(content, content_type)
+async def docs_append(
+    content: str,
+    content_type: str = "markdown",
+    doc_url: Optional[str] = None,
+) -> dict:
+    """Append `content` to the end of the active Doc. Snapshots the Doc first."""
+    return await tools.docs_append(content, content_type, doc_url)
 
 
 @mcp.tool()
@@ -87,6 +104,32 @@ async def docs_screenshot(scroll_to: str = "top", path: Optional[str] = None) ->
 async def docs_get_state() -> dict:
     """Return a snapshot of the active Doc's URL / title / size."""
     return await tools.docs_get_state()
+
+
+@mcp.tool()
+async def docs_check_drift(doc_url: Optional[str] = None) -> dict:
+    """Preview whether the Doc has changed since our last push.
+
+    Returns `{drifted, drift_summary, baseline_exists, ...}`. Use before
+    `docs_replace_all` if you want to show the diff to the user instead of
+    blindly triggering a drift abort.
+    """
+    return await tools.docs_check_drift(doc_url)
+
+
+@mcp.tool()
+async def docs_restore_from_backup(
+    doc_url: Optional[str] = None,
+    backup_timestamp: Optional[str] = None,
+) -> dict:
+    """Replace the Doc with a previously saved HTML backup.
+
+    Args:
+        doc_url: Doc to restore into.
+        backup_timestamp: Specific backup id (format `YYYYMMDD_HHMMSS`).
+            Defaults to the most recent.
+    """
+    return await tools.docs_restore_from_backup(doc_url, backup_timestamp)
 
 
 # ---------------------------------------------------------------------------
