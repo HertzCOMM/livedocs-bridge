@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "livedocs-bridge": {
+      "command": "livedocs-bridge",
+      "transportType": "stdio",
+      "env": {
+        "LIVEDOCS_CDP_URL": "http://127.0.0.1:19825"
+      },
+      "disabled": false,
+      "autoApprove": ["docs_get_state", "docs_screenshot"]
+    }
+  }
+}
