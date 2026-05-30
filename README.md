@@ -46,62 +46,99 @@ the editor with frame-scoped keyboard / clipboard. No data leaves the machine.
 
 ---
 
-## Install
+## Install in one command
 
 ```bash
-pip install livedocs-bridge
-# or, recommended:
-uv pip install livedocs-bridge
+uvx livedocs-bridge install
 ```
 
-You also need the Playwright runtime (one-time, ~200 MB):
+or, if you prefer pip:
 
 ```bash
-python -m playwright install chromium
+pip install livedocs-bridge && livedocs-bridge install
 ```
 
-> You can skip the Playwright Chromium download if you only attach to an external
-> Chrome (the CDP attach path doesn't launch a browser). It's installed by default
-> because most setup guides assume it.
+That single command does everything:
+
+- Ensures Playwright chromium is present
+- Finds a free CDP port
+- Locates Chrome / Chromium on your OS
+- Launches Chrome detached with a dedicated profile (`~/.livedocs-chrome-profile`)
+- Atomically patches your `claude_desktop_config.json` (timestamped backup kept)
+- Probes the CDP endpoint to confirm it's actually responding
+- Prints a JSON report and the single concrete next thing you have to do
+
+```bash
+livedocs-bridge install --client=cursor      # Cursor instead
+livedocs-bridge install --client=none        # just launch Chrome, give me the JSON snippet
+livedocs-bridge install --no-launch          # patch config but don't start Chrome
+livedocs-bridge install --no-json            # human-readable output
+```
+
+After install, **two things you still have to do yourself** (LLMs can't):
+
+1. Log in to Google in the new Chrome window.
+2. Cmd+Q quit Claude Desktop and re-open it.
+
+Then verify:
+
+```bash
+livedocs-bridge self-test
+```
+
+This opens a throwaway Doc, edits it, screenshots, and reads the marker back
+to confirm the install actually works. If you see `"success": true` and the
+screenshot shows the marker line, you're done.
 
 ---
 
-## Setup Chrome
+## Letting an LLM install it for you
 
-You need a Chrome instance running with `--remote-debugging-port` and logged into
-the Google account that owns the Doc.
+Any LLM client that can run shell commands (Claude Code, Cursor agent, Cline,
+Continue, Windsurf) can install this end-to-end. Paste this:
 
-**Option A — bb-browser (recommended):**
+> Install `https://github.com/HertzCOMM/livedocs-bridge` and wire it into my
+> Claude Desktop. Use `uvx livedocs-bridge install` then run
+> `livedocs-bridge doctor` to confirm.
 
-If you already use [bb-browser](https://github.com/your-org/bb-browser) for other
-agent automation, it spawns a managed Chrome on port `19825` with a dedicated
-profile. Nothing else to do.
+Your only manual steps are: (1) approve the bash commands, (2) log in to Google
+in the Chrome window that opens, (3) Cmd+Q Claude Desktop and reopen it.
+Everything else the agent does for you.
 
-**Option B — DIY:**
+---
+
+## Setup Chrome manually (only if you skip `install`)
 
 ```bash
 # macOS
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
   --remote-debugging-port=19825 \
   --user-data-dir="$HOME/.livedocs-chrome-profile"
+```
 
+```bash
 # Linux
 google-chrome \
   --remote-debugging-port=19825 \
   --user-data-dir="$HOME/.livedocs-chrome-profile"
+```
 
-# Windows (PowerShell)
+```powershell
+# Windows
 & "C:\Program Files\Google\Chrome\Application\chrome.exe" `
   --remote-debugging-port=19825 `
   --user-data-dir="$env:USERPROFILE\.livedocs-chrome-profile"
 ```
 
-Log in to Google in that Chrome window once. The profile persists, so future runs
-are silent.
+Or use the bundled helper, which picks the right Chrome binary and port for you:
+
+```bash
+livedocs-bridge launch-chrome
+```
 
 ---
 
-## Wire into your MCP client
+## Wire into your MCP client manually (only if you skip `install`)
 
 ### Claude Desktop
 
@@ -113,6 +150,7 @@ are silent.
   "mcpServers": {
     "livedocs-bridge": {
       "command": "livedocs-bridge",
+      "args": ["serve"],
       "env": { "LIVEDOCS_CDP_URL": "http://127.0.0.1:19825" }
     }
   }
@@ -121,18 +159,7 @@ are silent.
 
 ### Cursor
 
-`~/.cursor/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "livedocs-bridge": {
-      "command": "livedocs-bridge",
-      "env": { "LIVEDOCS_CDP_URL": "http://127.0.0.1:19825" }
-    }
-  }
-}
-```
+`~/.cursor/mcp.json` — same block as above.
 
 ### Cline (VS Code)
 
@@ -143,6 +170,7 @@ are silent.
   "mcpServers": {
     "livedocs-bridge": {
       "command": "livedocs-bridge",
+      "args": ["serve"],
       "env": { "LIVEDOCS_CDP_URL": "http://127.0.0.1:19825" },
       "autoApprove": ["docs_get_state", "docs_screenshot"]
     }
@@ -154,6 +182,34 @@ Continue and Windsurf use the same MCP-stdio config shape — drop the same bloc
 into their config file.
 
 Full examples live in [`examples/`](examples/).
+
+---
+
+## Diagnose when something breaks
+
+```bash
+livedocs-bridge doctor
+```
+
+prints a JSON report with one check per concern. Each failed check carries a
+`fix` field with the exact command to run. Sample output:
+
+```json
+{
+  "checks": {
+    "livedocs_bridge_on_path":  {"ok": true,  "detail": "Found ..."},
+    "chrome_installed":         {"ok": true,  "detail": "Chrome at ..."},
+    "chrome_cdp_reachable":     {"ok": false, "detail": "No response from http://127.0.0.1:19825",
+                                 "fix": "Start Chrome with the CDP profile: `livedocs-bridge launch-chrome`."},
+    "client_config_has_entry":  {"ok": true,  "detail": "livedocs-bridge wired into ..."},
+    "chrome_profile_dir":       {"ok": true,  "detail": "Profile dir writable at ..."}
+  },
+  "overall": "needs_action",
+  "next_human_action": "Start Chrome with the CDP profile: `livedocs-bridge launch-chrome`."
+}
+```
+
+Pass `--no-json` for human-readable output.
 
 ---
 
@@ -169,7 +225,7 @@ unchanged. No browser tab popped, no permission prompt, no API key.
 
 ---
 
-## Tools
+## MCP tools
 
 | Name | Signature | Purpose |
 | --- | --- | --- |
@@ -182,6 +238,19 @@ unchanged. No browser tab popped, no permission prompt, no API key.
 
 All tools return `{"success": bool, ...}` so MCP clients can branch on the result
 instead of catching exceptions.
+
+## CLI subcommands
+
+| Command | Purpose |
+| --- | --- |
+| `livedocs-bridge serve` | Run the MCP stdio server. This is what your MCP client launches. Default when run with no args. |
+| `livedocs-bridge install` | Idempotent install + client wiring. JSON output by default. Non-zero exit on failure. |
+| `livedocs-bridge doctor` | Structured health check. Exit code `0` healthy / `2` needs action. |
+| `livedocs-bridge self-test` | End-to-end smoke that writes a marker to a throwaway Doc and screenshots it. Exit code `0` pass / `3` fail. |
+| `livedocs-bridge launch-chrome` | Start the managed CDP Chrome without touching any MCP config. |
+
+Every subcommand prints a single JSON object to stdout. Exit codes are stable
+so LLMs can branch deterministically without parsing stderr.
 
 ---
 

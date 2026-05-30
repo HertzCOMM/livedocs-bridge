@@ -2,6 +2,7 @@
   "mcpServers": {
     "livedocs-bridge": {
       "command": "livedocs-bridge",
+      "args": ["serve"],
       "transportType": "stdio",
       "env": {
         "LIVEDOCS_CDP_URL": "http://127.0.0.1:19825"
