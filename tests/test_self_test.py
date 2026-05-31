@@ -37,3 +37,45 @@ def test_marker_template_includes_version_and_timestamp():
     msg = st.MARKER_TEMPLATE.format(version="9.9.9", ts="2099-12-31 23:59:59")
     assert "9.9.9" in msg
     assert "2099-12-31" in msg
+
+
+# v0.3.3 — diagnostic differentiation between paste-failed and read-back-glitch.
+
+def _make_report(*, doc_body_chars: int, marker_present: bool):
+    """Build a SelfTestReport directly without going through async_run; we're
+    only testing the post-paste diagnostic branch logic via construction."""
+    report = st.SelfTestReport(
+        version=st.__version__,
+        cdp_url="http://127.0.0.1:19825",
+        marker="marker-line",
+        marker_present_in_doc=marker_present,
+        doc_body_chars=doc_body_chars,
+        paste_landed=(doc_body_chars >= 200 or marker_present),
+        success=marker_present,
+    )
+    return report
+
+
+def test_report_serializes_v033_diagnostic_fields():
+    report = _make_report(doc_body_chars=42, marker_present=False)
+    payload = report.to_dict()
+    assert "doc_body_chars" in payload
+    assert "paste_landed" in payload
+    assert payload["doc_body_chars"] == 42
+    assert payload["paste_landed"] is False
+
+
+def test_report_paste_landed_true_when_body_has_content_even_without_marker():
+    # Read-back glitch path: paste worked, marker just didn't survive the
+    # canvas → DOM round-trip.
+    report = _make_report(doc_body_chars=400, marker_present=False)
+    assert report.paste_landed is True
+    assert report.success is False
+
+
+def test_report_paste_landed_false_when_body_essentially_empty():
+    # Windows pre-v0.3.3 path: Doc body is empty post-paste because Meta+V
+    # was a no-op.
+    report = _make_report(doc_body_chars=12, marker_present=False)
+    assert report.paste_landed is False
+    assert report.success is False

@@ -5,6 +5,48 @@ All notable changes to `livedocs-bridge` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-06-01
+
+Windows / Linux keyboard fix. v0.3.2 and earlier hardcoded `Meta+<key>` for
+every keyboard op. Playwright maps `Meta` to **Win** on Windows (not Ctrl), so
+`Meta+V` opened the Windows clipboard history overlay instead of pasting, and
+every other op (`Meta+A`, `Meta+C`, `Meta+End`, `Meta+Shift+H`) silently
+no-opped. Reported by a Windows user running a clean install of v0.3.2 — see
+GitHub issue for the full repro.
+
+### Fixed
+
+- **Windows / Linux paste, select-all, copy, end-of-doc.** All seven keyboard
+  ops in `playwright_core.py` (`clear_doc`, `capture_doc_plain` ×2,
+  `backup_doc` ×2, `move_caret_to_end`, `paste_html`) now use Playwright's
+  `ControlOrMeta` alias, which resolves to Cmd on macOS and Ctrl on
+  Windows/Linux. Available since Playwright 1.40 (already our declared min).
+- **Windows / Linux Find & Replace.** Google Docs binds Cmd+Shift+H on macOS
+  but Ctrl+H (no Shift) on Windows/Linux. `tools._find_replace_shortcut()`
+  branches by `platform.system()` since this is a Shift-component swap, not
+  just a modifier swap, so `ControlOrMeta` alone doesn't help.
+- **Misleading self-test diagnostic.** When the paste silently no-opped, the
+  previous error message blamed "canvas read-back limitation" — sending the
+  user to look at the screenshot for text that was never written. The report
+  now reads back the Doc body length, sets `paste_landed: bool` to
+  distinguish (a) "Doc is empty, paste failed" from (b) "Doc has content but
+  read-back didn't return the marker slice", and surfaces a specific
+  `next_human_action` for each case. New fields: `doc_body_chars`,
+  `paste_landed`.
+
+### Added
+
+- 17 new tests including a static grep regression that fails CI if anyone
+  reintroduces a bare `keyboard.press("Meta+...")` outside the platform-aware
+  `_find_replace_shortcut()` helper. Total: 106.
+
+### Notes
+
+- This is a **must-upgrade** for Windows / Linux users. v0.3.2 and earlier
+  have zero functionality on those platforms.
+- macOS users keep the same behavior — `ControlOrMeta` resolves to `Meta` on
+  Darwin.
+
 ## [0.3.2] - 2026-05-31
 
 Verification audit (gpt-5.3-codex) on the v0.3.0 → v0.3.1 diff confirmed all

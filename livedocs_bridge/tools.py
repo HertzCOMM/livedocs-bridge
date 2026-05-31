@@ -44,6 +44,18 @@ from .playwright_core import (
 log = logging.getLogger("livedocs_bridge.tools")
 
 
+def _find_replace_shortcut() -> str:
+    """Google Docs Find & Replace dialog keystroke per OS.
+
+    macOS: Cmd+Shift+H. Windows / Linux: Ctrl+H. Playwright's `ControlOrMeta`
+    alias handles modifier-only swaps but not the Shift divergence — Docs
+    explicitly binds different keys, not just different modifiers.
+    """
+    import platform
+
+    return "Meta+Shift+H" if platform.system() == "Darwin" else "Control+H"
+
+
 def _ok(data: dict[str, Any]) -> dict[str, Any]:
     return {"success": True, **data}
 
@@ -292,7 +304,10 @@ async def docs_find_replace(
             page = await find_or_open_doc(session)
             editor = await get_docs_editor(page)
             await editor.editable.focus()
-            await page.keyboard.press("Meta+Shift+H")
+            # Find & Replace shortcut differs by OS — Docs uses Cmd+Shift+H on
+            # macOS but Ctrl+H (no Shift) on Windows/Linux. ControlOrMeta isn't
+            # enough here because the Shift component diverges too.
+            await page.keyboard.press(_find_replace_shortcut())
             await page.wait_for_timeout(800)
             replaced = await _drive_find_replace_dialog(
                 page, find, replace, all_occurrences

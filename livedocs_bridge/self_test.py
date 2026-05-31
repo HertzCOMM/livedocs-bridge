@@ -52,6 +52,10 @@ class SelfTestReport:
     screenshot_base64: Optional[str] = None
     marker: Optional[str] = None
     marker_present_in_doc: bool = False
+    # v0.3.3: split paste-failed vs read-back-glitch so the user (or LLM) isn't
+    # sent looking at the screenshot for text that was never written.
+    doc_body_chars: int = 0
+    paste_landed: bool = False
     success: bool = False
     error: Optional[str] = None
     next_human_action: Optional[str] = None
@@ -68,6 +72,8 @@ class SelfTestReport:
             "screenshot_base64": self.screenshot_base64,
             "marker": self.marker,
             "marker_present_in_doc": self.marker_present_in_doc,
+            "doc_body_chars": self.doc_body_chars,
+            "paste_landed": self.paste_landed,
             "success": self.success,
             "error": self.error,
             "next_human_action": self.next_human_action,
@@ -188,11 +194,34 @@ async def _run_async(
                 png_b64 = base64.b64encode(Path(tmp).read_bytes()).decode("ascii")
 
         success = marker_present
-        next_action = None if success else (
-            "Self-test paste ran but the marker text was not found in the Doc. "
-            "Check the screenshot; if the Doc shows the marker visually, this "
-            "is likely a canvas read-back limitation and the install is fine."
-        )
+        # Distinguish two failure modes when the marker isn't found:
+        #   (a) The Doc body is essentially empty (just Docs' smart-chip
+        #       toolbar) → the paste never landed. Most common cause on Windows
+        #       prior to v0.3.3 was `Meta+V` being interpreted as Win+V
+        #       (clipboard history overlay) instead of Ctrl+V.
+        #   (b) The Doc has content but the read-back returned the wrong slice
+        #       → canvas read-back limitation, install is actually fine.
+        # The threshold (200 chars) is conservative — Docs' chip toolbar
+        # contributes well under 100 chars; the self-test body is ~400+.
+        body_chars = len(text.strip())
+        paste_landed = body_chars >= 200 or marker_present
+        if success:
+            next_action = None
+        elif paste_landed:
+            next_action = (
+                f"Doc has {body_chars} chars but the marker line was not in the "
+                "read-back slice. Check the screenshot — if you can SEE the "
+                "marker in the screenshot, this is a canvas read-back "
+                "limitation and the install is fine."
+            )
+        else:
+            next_action = (
+                f"Doc body is essentially empty ({body_chars} chars) after the "
+                "paste. The clipboard write reported OK but the Ctrl+V keystroke "
+                "did not land. Verify Chrome had focus during self-test, and "
+                "confirm you are on livedocs-bridge >= 0.3.3 (earlier versions "
+                "used Meta+V which silently no-ops on Windows)."
+            )
         return SelfTestReport(
             version=__version__,
             cdp_url=cdp_url,
@@ -201,6 +230,8 @@ async def _run_async(
             screenshot_base64=png_b64,
             marker=marker,
             marker_present_in_doc=marker_present,
+            doc_body_chars=body_chars,
+            paste_landed=paste_landed,
             success=success,
             next_human_action=next_action,
         )

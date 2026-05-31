@@ -48,6 +48,13 @@ SCROLL_CONTAINER_SELECTOR = ".kix-appview-editor"
 DEFAULT_IFRAME_TIMEOUT_MS = 45000
 DEFAULT_RELOAD_TIMEOUT_MS = 30000
 
+# v0.3.3: keyboard shortcuts MUST use Playwright's `ControlOrMeta` alias, not
+# `Meta`. Playwright maps `Meta` to Win on Windows (not Ctrl), so `Meta+V`
+# opens Windows clipboard history overlay instead of pasting — every keyboard
+# op silently no-ops on Windows. `ControlOrMeta` resolves to Cmd on macOS and
+# Ctrl on Windows/Linux, which is what we want everywhere. Available since
+# Playwright 1.40 (our declared minimum).
+
 
 def get_cdp_url() -> str:
     """Resolve the CDP endpoint from env (LIVEDOCS_CDP_URL) or default."""
@@ -257,7 +264,7 @@ async def clear_doc(editor: DocsEditor) -> None:
     since the last push.
     """
     await editor.editable.focus()
-    await editor.page.keyboard.press("Meta+A")
+    await editor.page.keyboard.press("ControlOrMeta+A")
     await editor.page.wait_for_timeout(150)
     await editor.page.keyboard.press("Backspace")
     await editor.page.wait_for_timeout(300)
@@ -270,9 +277,9 @@ async def capture_doc_plain(editor: DocsEditor) -> str:
     push (to refresh the baseline saved via `drift.save_last_push`).
     """
     await editor.editable.focus()
-    await editor.page.keyboard.press("Meta+A")
+    await editor.page.keyboard.press("ControlOrMeta+A")
     await editor.page.wait_for_timeout(300)
-    await editor.page.keyboard.press("Meta+C")
+    await editor.page.keyboard.press("ControlOrMeta+C")
     await editor.page.wait_for_timeout(600)
     js = """
     async () => {
@@ -311,9 +318,9 @@ async def backup_doc(
     target_id = doc_url_or_id or page.url
 
     await editor.editable.focus()
-    await page.keyboard.press("Meta+A")
+    await page.keyboard.press("ControlOrMeta+A")
     await page.wait_for_timeout(300)
-    await page.keyboard.press("Meta+C")
+    await page.keyboard.press("ControlOrMeta+C")
     await page.wait_for_timeout(600)
 
     js = """
@@ -387,7 +394,7 @@ async def backup_doc(
 
 async def move_caret_to_end(editor: DocsEditor) -> None:
     await editor.editable.focus()
-    await editor.page.keyboard.press("Meta+End")
+    await editor.page.keyboard.press("ControlOrMeta+End")
     await editor.page.wait_for_timeout(100)
 
 
@@ -424,7 +431,7 @@ async def paste_html(editor: DocsEditor, html: str) -> str:
     if not isinstance(status, str) or not status.startswith("CLIP_OK"):
         return status if isinstance(status, str) else "CLIP_ERR unknown"
     await editor.editable.focus()
-    await editor.page.keyboard.press("Meta+V")
+    await editor.page.keyboard.press("ControlOrMeta+V")
     await editor.page.wait_for_timeout(1500)
     return status
 
