@@ -17,6 +17,12 @@ import pytest
 from livedocs_bridge import drift as drift_mod
 from livedocs_bridge import tools
 
+# Capture references to the real implementations BEFORE any test monkeypatches
+# them on the `tools` module. The v0.3.5 entropy / empty-source regressions
+# call the real verifier directly with a hand-rolled mock editor.
+_REAL_VERIFY_PASTE_LANDED = tools._verify_paste_landed
+_REAL_CAPTURE_DOC_PLAIN = tools.capture_doc_plain
+
 
 class _FakePage:
     def __init__(self, url="https://docs.google.com/document/d/FAKE_DOC_ID_1234567890abcdef/edit"):
@@ -108,9 +114,14 @@ def _patch_common(
     # don't have to thread fingerprint matching through their mocks; failure
     # paths override this in their own tests.
     async def fake_verify(editor, source_plain):
+        # v0.3.5 meta shape: fingerprints list + empty_source / low_entropy flags.
         return True, post_text, {
-            "fingerprint": (source_plain or "")[:60],
+            "fingerprints": [(source_plain or "")[:60]] if source_plain else [],
+            "fingerprints_matched": 1 if source_plain else 0,
+            "fingerprints_required": 1 if source_plain else 0,
             "fingerprint_present": True,
+            "empty_source": not bool(source_plain),
+            "low_entropy_fingerprint": False,
             "retries": 0,
             "source_chars": len(source_plain or ""),
             "captured_chars": len(post_text or ""),
@@ -469,8 +480,12 @@ async def test_replace_all_aborts_when_paste_verification_fails(monkeypatch, tmp
 
     async def fake_verify_fails(editor, source_plain):
         return False, "OLD CONTENT (paste no-opped)", {
-            "fingerprint": (source_plain or "")[:60],
+            "fingerprints": [(source_plain or "")[:60]],
+            "fingerprints_matched": 0,
+            "fingerprints_required": 1,
             "fingerprint_present": False,
+            "empty_source": False,
+            "low_entropy_fingerprint": False,
             "retries": 1,
             "source_chars": len(source_plain or ""),
             "captured_chars": 30,
@@ -495,6 +510,136 @@ async def test_replace_all_saves_baseline_only_when_verified(monkeypatch, tmp_pa
     assert res["baseline_saved"] is True
     doc_id = drift_mod.safe_doc_key(page.url)
     assert drift_mod.last_push_path(backup_dir, doc_id).read_text() == "verified-text"
+
+
+# -----------------------------------------------------------------------------
+# v0.3.5 — codex audit regressions on the v0.3.4 patches.
+# -----------------------------------------------------------------------------
+
+
+def test_pick_fingerprints_multi_chunks_for_long_content():
+    # Non-repetitive content so distinct chunks survive the dedup check.
+    long = (
+        "alpha distinctive ALPHA marker chunk near the beginning of source content. "
+        "bravo distinctive BRAVO marker chunk somewhere through the middle of source content. "
+        "charlie distinctive CHARLIE marker chunk closer to the end of source content. "
+        "delta distinctive DELTA marker chunk at the very tail of source content."
+    )
+    fps = tools._pick_fingerprints(long)
+    assert len(fps) >= 2
+    # Spread-out positions, not all the same chunk.
+    assert len(set(fps)) >= 2
+
+
+def test_pick_fingerprints_short_content_returns_single():
+    fps = tools._pick_fingerprints("short content")
+    assert fps == ["short content"]
+
+
+def test_pick_fingerprints_empty_returns_empty():
+    assert tools._pick_fingerprints("") == []
+
+
+def test_distinct_alnum_chars_low_entropy():
+    assert tools._distinct_alnum_chars("AAAAAAAA") == 1
+    assert tools._distinct_alnum_chars("AAA BBB CCC") == 3
+
+
+def test_distinct_alnum_chars_typical_sentence():
+    n = tools._distinct_alnum_chars("the quick brown fox jumps over the lazy dog")
+    assert n >= 20  # rich alphabet coverage
+
+
+async def test_replace_all_empty_source_requires_empty_capture(monkeypatch):
+    # MEDIUM #2: empty source must NOT auto-verify when capture is large —
+    # that would let a no-op paste look successful and corrupt the baseline.
+    async def fake_capture_doc_plain(editor):
+        return "lots of stale content " * 20  # > 80 chars cap
+
+    monkeypatch.setattr(tools, "capture_doc_plain", fake_capture_doc_plain)
+    verified, _, meta = await _REAL_VERIFY_PASTE_LANDED(MagicMock(), "")
+    assert verified is False
+    assert meta["empty_source"] is True
+    assert meta["captured_chars"] > 80
+
+
+async def test_replace_all_empty_source_passes_when_capture_also_empty(monkeypatch):
+    async def fake_capture_doc_plain(editor):
+        return "  "  # whitespace-only counts as empty after normalization
+
+    monkeypatch.setattr(tools, "capture_doc_plain", fake_capture_doc_plain)
+    verified, _, meta = await _REAL_VERIFY_PASTE_LANDED(MagicMock(), "")
+    assert verified is True
+    assert meta["empty_source"] is True
+
+
+async def test_verify_paste_landed_flags_low_entropy_fingerprint(monkeypatch):
+    # MEDIUM #3: repetitive source should still be checked, but mark the meta
+    # so downstream callers know the verify is weak evidence.
+    async def fake_capture_doc_plain(editor):
+        return "AAAAAAAAAAAAAA"
+
+    monkeypatch.setattr(tools, "capture_doc_plain", fake_capture_doc_plain)
+    editor = MagicMock()
+    editor.page = MagicMock()
+    editor.page.wait_for_timeout = AsyncMock()
+
+    verified, _, meta = await _REAL_VERIFY_PASTE_LANDED(editor, "AAAAAAAAAAAAAA")
+    assert verified is True
+    assert meta["low_entropy_fingerprint"] is True
+
+
+async def test_verify_paste_landed_requires_two_of_three_fingerprints(monkeypatch):
+    # MEDIUM #3: a single-chunk false-match shouldn't be enough on its own.
+    # We construct a long source so 3 fingerprints are picked; capture has
+    # only one of them — verify must fail.
+    source = (
+        "Section ALPHA distinctive intro paragraph here a a a a a a a a a a a a a a a "
+        "Section BRAVO another distinctive body chunk b b b b b b b b b b b b b b b "
+        "Section CHARLIE concluding distinctive sentence c c c c c c c c c c c c c c c "
+    ) * 2
+    capture = "Section ALPHA distinctive intro paragraph here a a a a a a a"
+
+    async def fake_capture_doc_plain(editor):
+        return capture
+
+    monkeypatch.setattr(tools, "capture_doc_plain", fake_capture_doc_plain)
+    editor = MagicMock()
+    editor.page = MagicMock()
+    editor.page.wait_for_timeout = AsyncMock()
+
+    verified, _, meta = await _REAL_VERIFY_PASTE_LANDED(editor, source)
+    assert verified is False
+    assert meta["fingerprints_matched"] < meta["fingerprints_required"]
+
+
+async def test_replace_all_verification_failure_surfaces_reduced_drift_warning(
+    monkeypatch, tmp_path
+):
+    # MEDIUM #4: prior message lied about drift catching divergence on
+    # re-run. Verify the response now warns drift protection is reduced.
+    page, backup_dir = _patch_common(monkeypatch, tmp_path)
+
+    async def fake_verify_fails(editor, source_plain):
+        return False, "stale", {
+            "fingerprints": [(source_plain or "")[:60]],
+            "fingerprints_matched": 0,
+            "fingerprints_required": 1,
+            "fingerprint_present": False,
+            "empty_source": False,
+            "low_entropy_fingerprint": False,
+            "retries": 1,
+            "source_chars": len(source_plain or ""),
+            "captured_chars": 5,
+        }
+
+    monkeypatch.setattr(tools, "_verify_paste_landed", fake_verify_fails)
+    res = await tools.docs_replace_all("# new content", "markdown")
+    assert res["success"] is False
+    assert res["drift_protection_reduced"] is True
+    # The actionable message must NOT promise drift will catch divergence on re-run.
+    assert "drift will catch" not in res["recommended_next_action"].lower()
+    assert "reduced" in res["recommended_next_action"].lower()
 
 
 async def test_replace_all_surfaces_drift_hunk_meta(monkeypatch, tmp_path):

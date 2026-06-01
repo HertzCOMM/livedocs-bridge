@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import itertools
 import os
 import re
 import tempfile
@@ -33,6 +34,16 @@ from typing import Optional
 DEFAULT_KEEP_DAYS = 30
 LAST_PUSH_PREFIX = "_last_pushed_"
 BACKUP_PREFIX = "doc_backup_"
+
+# v0.3.5: cap per-input size before feeding `difflib.unified_diff`. A
+# pathological Doc body (multi-MB) would force `list(unified_diff(...))` to
+# materialize hundreds of MB of diff lines before our line-cap truncated for
+# display. Override via `LIVEDOCS_DRIFT_MAX_INPUT_BYTES`. Inputs larger than
+# this trigger drift=True with a "too large to diff" summary — fail safe.
+DEFAULT_DRIFT_MAX_INPUT_BYTES = 2 * 1024 * 1024  # 2 MB per side
+# Also stream-cap the diff output itself so we never materialize more than
+# this many lines even if the user raises `diff_max_lines` past it.
+DRIFT_HARD_LINE_CAP = 5000
 
 # Google Doc IDs are URL-safe base64 (`A-Za-z0-9_-`) and ~44 chars in practice.
 # Anything outside this charset is either a corrupted URL or hostile input;
@@ -187,47 +198,120 @@ def check_drift(
     if not path.exists():
         return False, "[no baseline — first inject for this doc]", {}
     last = path.read_text(encoding="utf-8")
-    if last.strip() == (current_plain or "").strip():
+    current = current_plain or ""
+    if last.strip() == current.strip():
         return False, "", {}
-    diff_lines = list(
-        difflib.unified_diff(
-            last.splitlines(),
-            (current_plain or "").splitlines(),
-            fromfile="last_pushed",
-            tofile="current_doc",
-            lineterm="",
-            n=2,
+
+    # v0.3.5 HIGH #1: hard-cap inputs BEFORE the diff is materialized. A
+    # multi-MB Doc would otherwise OOM the agent. We still report drift, but
+    # the summary just says "too large to diff" with the input sizes — caller
+    # must decide via screenshot / manual inspection.
+    max_bytes = _max_diff_input_bytes()
+    if (
+        len(last.encode("utf-8")) > max_bytes
+        or len(current.encode("utf-8")) > max_bytes
+    ):
+        summary = (
+            f"⚠ DRIFT DETECTED BUT INPUT TOO LARGE TO DIFF: baseline="
+            f"{len(last)} chars, current={len(current)} chars (cap "
+            f"{max_bytes // 1024} KiB per side). `force=True` overwrites "
+            f"ALL drift including content this summary doesn't show. "
+            f"Inspect the Doc visually before deciding."
         )
+        return True, summary, {
+            "hunks_total": -1,
+            "hunks_shown": 0,
+            "lines_total": -1,
+            "lines_shown": 0,
+            "truncated": True,
+            "max_input_exceeded": True,
+            "baseline_chars": len(last),
+            "current_chars": len(current),
+        }
+
+    # Stream-cap the diff iterator so we never materialize more than
+    # DRIFT_HARD_LINE_CAP lines, even if the diff itself would be enormous.
+    # We still need to count hunks_total beyond the displayed slice, so we
+    # iterate twice: once up to diff_max_lines for the display copy, then
+    # continue the same iterator counting `@@` lines until the hard cap.
+    diff_iter = difflib.unified_diff(
+        last.splitlines(),
+        current.splitlines(),
+        fromfile="last_pushed",
+        tofile="current_doc",
+        lineterm="",
+        n=2,
     )
-    hunks_total = sum(1 for ln in diff_lines if ln.startswith("@@"))
-    shown_lines = diff_lines[:diff_max_lines]
-    hunks_shown = sum(1 for ln in shown_lines if ln.startswith("@@"))
-    truncated = len(diff_lines) > diff_max_lines
+    capped_iter = itertools.islice(diff_iter, DRIFT_HARD_LINE_CAP + 1)
+    shown_lines: list[str] = []
+    hunks_shown = 0
+    hunks_total = 0
+    lines_total = 0
+    for ln in capped_iter:
+        lines_total += 1
+        is_hunk = ln.startswith("@@")
+        if is_hunk:
+            hunks_total += 1
+        if len(shown_lines) < diff_max_lines:
+            shown_lines.append(ln)
+            if is_hunk:
+                hunks_shown += 1
+    hard_capped = lines_total > DRIFT_HARD_LINE_CAP
+    if hard_capped:
+        # Subtract the sentinel line we read just to detect the overflow.
+        lines_total = DRIFT_HARD_LINE_CAP
+    truncated = lines_total > len(shown_lines) or hard_capped
 
     summary_parts: list[str] = []
     if truncated:
-        # Loud warning at the TOP so an agent reading top-down sees it before
-        # the diff itself. `force=True` overwrites ALL drift, not just shown.
+        if hard_capped:
+            count_phrase = (
+                f"at least {hunks_total} hunks "
+                f"(stream-capped at {DRIFT_HARD_LINE_CAP} diff lines; "
+                f"true hunk count is higher)"
+            )
+        else:
+            count_phrase = (
+                f"{hunks_shown} of {hunks_total} hunks "
+                f"({len(shown_lines)} of {lines_total} diff lines)"
+            )
         summary_parts.append(
-            f"⚠ DRIFT TRUNCATED: showing {hunks_shown} of {hunks_total} "
-            f"hunks ({len(shown_lines)} of {len(diff_lines)} diff lines). "
+            f"⚠ DRIFT TRUNCATED: showing {count_phrase}. "
             f"`force=True` overwrites ALL drift including the hidden hunks."
         )
         summary_parts.append("")
     summary_parts.append("\n".join(shown_lines))
     if truncated:
-        summary_parts.append(
-            f"... ({len(diff_lines) - len(shown_lines)} more diff lines, "
-            f"{hunks_total - hunks_shown} more hunks hidden)"
-        )
+        if hard_capped:
+            summary_parts.append(
+                f"... (stream-capped at {DRIFT_HARD_LINE_CAP} diff lines; "
+                "remaining hunks not counted)"
+            )
+        else:
+            summary_parts.append(
+                f"... ({lines_total - len(shown_lines)} more diff lines, "
+                f"{hunks_total - hunks_shown} more hunks hidden)"
+            )
     meta = {
         "hunks_total": hunks_total,
         "hunks_shown": hunks_shown,
-        "lines_total": len(diff_lines),
+        "lines_total": lines_total,
         "lines_shown": len(shown_lines),
         "truncated": truncated,
+        "hard_capped": hard_capped,
     }
     return True, "\n".join(summary_parts), meta
+
+
+def _max_diff_input_bytes() -> int:
+    raw = os.environ.get("LIVEDOCS_DRIFT_MAX_INPUT_BYTES")
+    if not raw:
+        return DEFAULT_DRIFT_MAX_INPUT_BYTES
+    try:
+        n = int(raw)
+        return n if n > 0 else DEFAULT_DRIFT_MAX_INPUT_BYTES
+    except (TypeError, ValueError):
+        return DEFAULT_DRIFT_MAX_INPUT_BYTES
 
 
 def prune_old_backups(

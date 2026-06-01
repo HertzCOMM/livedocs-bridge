@@ -5,6 +5,66 @@ All notable changes to `livedocs-bridge` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-06-01
+
+Codex adversarial audit on the v0.3.4 patches surfaced 1 HIGH, 4 MEDIUM,
+2 LOW. All fixed.
+
+### Fixed
+
+- **[HIGH] Unbounded diff materialization (OOM risk).** `check_drift` did
+  `list(unified_diff(...))` against the full baseline + current text. A
+  multi-MB Doc body would allocate hundreds of MB of diff lines before our
+  line cap truncated for display. v0.3.5: inputs > 2 MB per side trigger
+  `drifted=True` with a "too large to diff" summary (override via
+  `LIVEDOCS_DRIFT_MAX_INPUT_BYTES`); the diff iterator is consumed with
+  `itertools.islice(DRIFT_HARD_LINE_CAP=5000)` so we never materialize more
+  than 5K lines even when the line cap is raised.
+- **[MEDIUM] Empty-source paste auto-verified.** An empty `content` made
+  `_verify_paste_landed` short-circuit to `verified=True` without proving
+  the paste landed. A stale capture could then be saved as the new baseline.
+  v0.3.5: empty source requires the post-paste capture to also be empty
+  (≤ 80 chars of smart-chip boilerplate); otherwise the paste didn't truly
+  clear-and-replace, and the response fails closed with `empty_source: true`
+  in the verification meta.
+- **[MEDIUM] Low-entropy fingerprint false positives.** A repetitive source
+  like `"A" * 500` yielded a `"AAA"` fingerprint that matched almost any
+  Doc body. v0.3.5: picks up to 3 spread-out fingerprints, requires ≥ 2 to
+  match, and flags `low_entropy_fingerprint: true` when the combined
+  fingerprints have < 6 distinct alphanumeric characters so callers know
+  the result is weaker evidence than usual.
+- **[MEDIUM] Misleading recovery advice on verification failure.** The
+  previous message told the user "re-run docs_replace_all (drift will catch
+  real divergence)" — but the baseline was NOT saved, so re-run hits the
+  "no baseline → first inject" path and drift returns False regardless of
+  Doc content. v0.3.5: response now carries `drift_protection_reduced: true`
+  and a 3-step actionable message (screenshot → restore or accept reduced
+  protection until next verified push).
+- **[LOW] CDP timeout message too prescriptive.** The message named
+  `livedocs-bridge launch-chrome` as the only recovery path, but bb-browser
+  users / managed daemons / remote-host setups don't use it. v0.3.5: generic
+  recovery first ("restart the Chrome instance backing this CDP endpoint —
+  same `--remote-debugging-port` + `--user-data-dir`"), then optional
+  `launch-chrome` example for self-managed setups.
+- **[LOW] Negative env timeout silently accepted.** `LIVEDOCS_CDP_CONNECT_
+  TIMEOUT_MS=-5000` parsed cleanly and was passed straight to Playwright.
+  v0.3.5: values below `MIN_CDP_CONNECT_TIMEOUT_MS=1000` snap back to the
+  default.
+
+### Added
+
+- `LIVEDOCS_DRIFT_MAX_INPUT_BYTES` env var (default 2 MiB per side).
+- `livedocs_bridge.tools._pick_fingerprints` / `_distinct_alnum_chars` helpers.
+- 19 new regression tests (141 total).
+
+### Notes
+
+- All v0.3.4 functionality preserved; this is a hardening release. v0.3.4
+  callers continue to work, with three response-field additions:
+  `drift_protection_reduced`, `drift_truncated`, and `paste_verification_meta`
+  shape now includes `fingerprints` / `fingerprints_matched` / `empty_source` /
+  `low_entropy_fingerprint`.
+
 ## [0.3.4] - 2026-06-01
 
 Three production bugs from real workflow use of the underlying skill (see

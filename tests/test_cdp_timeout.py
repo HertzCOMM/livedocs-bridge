@@ -70,6 +70,56 @@ async def test_browser_session_raises_specific_error_on_handshake_timeout(monkey
     assert session._pw is None
 
 
+# v0.3.5 — codex audit regressions on the v0.3.4 CDP timeout patch.
+
+def test_timeout_env_negative_falls_back_to_default(monkeypatch):
+    # LOW #6: negative env value was previously passed straight to Playwright.
+    monkeypatch.setenv("LIVEDOCS_CDP_CONNECT_TIMEOUT_MS", "-5000")
+    assert core.get_cdp_connect_timeout_ms() == core.DEFAULT_CDP_CONNECT_TIMEOUT_MS
+
+
+def test_timeout_env_below_floor_falls_back(monkeypatch):
+    monkeypatch.setenv("LIVEDOCS_CDP_CONNECT_TIMEOUT_MS", "500")
+    # 500ms is sub-second — too short for a real CDP session. We snap back to
+    # the default rather than honor it.
+    assert core.get_cdp_connect_timeout_ms() == core.DEFAULT_CDP_CONNECT_TIMEOUT_MS
+
+
+def test_timeout_env_at_floor_accepted(monkeypatch):
+    monkeypatch.setenv("LIVEDOCS_CDP_CONNECT_TIMEOUT_MS", "1000")
+    assert core.get_cdp_connect_timeout_ms() == 1000
+
+
+def test_min_timeout_constant_exposed():
+    assert core.MIN_CDP_CONNECT_TIMEOUT_MS == 1000
+
+
+async def test_timeout_error_message_is_generic_then_specific(monkeypatch):
+    # LOW #5: recovery message must work for bb-browser / daemon / remote
+    # setups, not just users who launched Chrome via livedocs-bridge.
+    fake_pw = MagicMock()
+    fake_pw.stop = AsyncMock()
+    fake_pw.chromium = MagicMock()
+    fake_pw.chromium.connect_over_cdp = AsyncMock(
+        side_effect=PlaywrightTimeout("Timeout 30000ms exceeded")
+    )
+
+    async def fake_start():
+        return fake_pw
+
+    monkeypatch.setattr(core, "async_playwright", lambda: MagicMock(start=fake_start))
+
+    session = core.BrowserSession(cdp_url="http://127.0.0.1:19825")
+    with pytest.raises(core.CDPConnectTimeout) as excinfo:
+        await session.start()
+    msg = str(excinfo.value)
+    # Generic recovery FIRST.
+    assert "restart the chrome instance" in msg.lower()
+    assert "--remote-debugging-port" in msg
+    # livedocs-bridge mention demoted to "If livedocs-bridge owns".
+    assert "if livedocs-bridge owns" in msg.lower()
+
+
 async def test_browser_session_passes_timeout_kwarg(monkeypatch):
     captured: dict = {}
 

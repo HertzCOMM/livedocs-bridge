@@ -62,17 +62,23 @@ DEFAULT_RELOAD_TIMEOUT_MS = 30000
 # in-band fix (kill + relaunch Chrome). Override with
 # `LIVEDOCS_CDP_CONNECT_TIMEOUT_MS`.
 DEFAULT_CDP_CONNECT_TIMEOUT_MS = 30000
+# v0.3.5 LOW #6: clamp env-provided timeouts to a sane positive minimum.
+# Sub-second connect deadlines never produce useful CDP sessions and the
+# negative-int path was previously silently passed through to Playwright.
+MIN_CDP_CONNECT_TIMEOUT_MS = 1000
 
 
 def get_cdp_connect_timeout_ms() -> int:
+    raw = os.environ.get("LIVEDOCS_CDP_CONNECT_TIMEOUT_MS")
+    if not raw:
+        return DEFAULT_CDP_CONNECT_TIMEOUT_MS
     try:
-        return int(
-            os.environ.get(
-                "LIVEDOCS_CDP_CONNECT_TIMEOUT_MS", DEFAULT_CDP_CONNECT_TIMEOUT_MS
-            )
-        )
+        parsed = int(raw)
     except (TypeError, ValueError):
         return DEFAULT_CDP_CONNECT_TIMEOUT_MS
+    if parsed < MIN_CDP_CONNECT_TIMEOUT_MS:
+        return DEFAULT_CDP_CONNECT_TIMEOUT_MS
+    return parsed
 
 
 def get_cdp_url() -> str:
@@ -132,15 +138,21 @@ class BrowserSession:
             # one instead of inheriting a half-started state.
             await self._pw.stop()
             self._pw = None
+            # v0.3.5 LOW #5: generic recovery first, then the
+            # livedocs-bridge example. bb-browser users, container daemons
+            # and remote-host setups don't drive Chrome via launch-chrome.
             raise CDPConnectTimeout(
                 f"connect_over_cdp({self.cdp_url}) timed out after "
-                f"{timeout_ms / 1000:.1f}s. This usually means Chrome's "
+                f"{timeout_ms / 1000:.1f}s. This usually means the Chrome "
                 f"browser-wide CDP session has corrupted (typical after 2-3 "
                 f"days of uptime). The HTTP /json/version probe may still "
-                f"return 200 but the protocol handshake hangs. Recovery: "
-                f"kill the Chrome process and re-launch via "
-                f"`livedocs-bridge launch-chrome`. user-data-dir is "
-                f"persistent so your Google login survives."
+                f"return 200 but the protocol handshake hangs. "
+                f"Recovery: restart the Chrome instance backing this CDP "
+                f"endpoint — kill the process and re-launch with the same "
+                f"`--remote-debugging-port` + `--user-data-dir`. "
+                f"If livedocs-bridge owns the Chrome process, "
+                f"`livedocs-bridge launch-chrome` will respawn it. "
+                f"`user-data-dir` is persistent so your Google login survives."
             ) from e
 
     async def stop(self) -> None:

@@ -251,6 +251,47 @@ def test_check_drift_counts_all_hunks(tmp_path):
     )
 
 
+# v0.3.5 — HIGH #1 regression: bound diff materialization for huge inputs.
+
+def test_check_drift_caps_oversized_input_without_running_diff(tmp_path, monkeypatch):
+    # Force a tiny input cap so we don't need to allocate 2 MB in a test.
+    monkeypatch.setenv("LIVEDOCS_DRIFT_MAX_INPUT_BYTES", "256")
+    base = "baseline content here\n" * 50  # ~1.1 KB > 256 B cap
+    current = "current content here\n" * 50
+    drift.save_last_push(base, "DOC_OVERSIZED", tmp_path)
+    drifted, summary, meta = drift.check_drift(current, "DOC_OVERSIZED", tmp_path)
+    assert drifted is True
+    assert "INPUT TOO LARGE" in summary or "max_input_exceeded" in str(meta)
+    assert meta["max_input_exceeded"] is True
+    assert meta["baseline_chars"] > 0
+    assert meta["current_chars"] > 0
+
+
+def test_check_drift_stream_caps_at_hard_line_limit(tmp_path, monkeypatch):
+    # Force the hard cap low so the test doesn't have to build a 5000-line diff.
+    monkeypatch.setattr(drift, "DRIFT_HARD_LINE_CAP", 50)
+    base = "\n".join(f"baseline_{i}_unique" for i in range(500))
+    current = "\n".join(f"current_{i}_unique" for i in range(500))
+    drift.save_last_push(base, "DOC_HARDCAP", tmp_path)
+    drifted, summary, meta = drift.check_drift(
+        current, "DOC_HARDCAP", tmp_path, diff_max_lines=10
+    )
+    assert drifted is True
+    assert meta["hard_capped"] is True
+    assert meta["lines_total"] == 50
+    assert "stream-capped" in summary.lower()
+
+
+def test_drift_max_input_bytes_env_invalid_falls_back(monkeypatch):
+    monkeypatch.setenv("LIVEDOCS_DRIFT_MAX_INPUT_BYTES", "garbage")
+    assert drift._max_diff_input_bytes() == drift.DEFAULT_DRIFT_MAX_INPUT_BYTES
+
+
+def test_drift_max_input_bytes_env_negative_falls_back(monkeypatch):
+    monkeypatch.setenv("LIVEDOCS_DRIFT_MAX_INPUT_BYTES", "-1")
+    assert drift._max_diff_input_bytes() == drift.DEFAULT_DRIFT_MAX_INPUT_BYTES
+
+
 def test_check_drift_truncation_warning_is_at_top(tmp_path):
     # Verify the loud truncation banner is BEFORE the diff body — an agent
     # reading top-down should hit the "force=True overwrites ALL drift"

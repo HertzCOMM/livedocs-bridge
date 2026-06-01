@@ -241,11 +241,24 @@ async def docs_replace_all(
                     paste_verification_meta=verify_meta,
                     backup_paths=_paths_dict(backup),
                     baseline_saved=False,
+                    # v0.3.5 MEDIUM #4: the prior message claimed drift would
+                    # catch real divergence on the re-run path. That's wrong:
+                    # baseline was NOT saved (we just refused), so the next
+                    # `docs_replace_all` hits the "no baseline → first inject"
+                    # branch and drift returns False regardless of what the
+                    # Doc actually contains. Be honest about that gap.
+                    drift_protection_reduced=True,
                     recommended_next_action=(
-                        "Screenshot the Doc with `docs_screenshot` to confirm "
-                        "visually. If content is wrong, `docs_restore_from_backup` "
-                        "to recover. If content is correct, the read-back failed — "
-                        "re-run `docs_replace_all` (drift will catch real divergence)."
+                        "Step 1: screenshot the Doc with `docs_screenshot` to "
+                        "confirm what's actually there. "
+                        "Step 2 (Doc visually wrong): `docs_restore_from_backup` "
+                        "to recover prior state. "
+                        "Step 2 (Doc visually correct, read-back glitched): "
+                        "drift protection is REDUCED until next verified push — "
+                        "the absent baseline means the next `docs_replace_all` "
+                        "will treat the Doc as a first-inject (no drift abort). "
+                        "Run `docs_check_drift` after the next successful "
+                        "verified push to confirm the baseline is back."
                     ),
                 )
             baseline_path = drift_mod.save_last_push(new_plain, doc_id, backup_dir)
@@ -293,13 +306,29 @@ def _short_diff(before: str, after: str, max_lines: int = 40) -> str:
     return summary
 
 
-# v0.3.4 — paste verification helpers (Bug 2).
+# v0.3.4 / v0.3.5 — paste verification helpers (Bug 2 + codex audit hardening).
 
 _VERIFY_FINGERPRINT_LEN = 60
 _VERIFY_MIN_FINGERPRINT_LEN = 20
 _VERIFY_RETRY_WAIT_MS = 2500
+# v0.3.5 MEDIUM #2: empty source path. After a Cmd+A+Backspace clear and a
+# paste of "" the Doc body should be ~empty (Docs may inject smart-chip
+# placeholder text). If the captured body exceeds this, the paste didn't
+# land — fail closed.
+_VERIFY_EMPTY_SOURCE_MAX_CAPTURED_CHARS = 80
+# v0.3.5 MEDIUM #3: fingerprint distinctiveness. Repetitive source like
+# "A" * 500 yields a "AAA" fingerprint that matches almost anything. We
+# require at least this many DISTINCT alphanumeric characters across the
+# combined fingerprint set, else we fall back to a hash-prefix check.
+_VERIFY_MIN_DISTINCT_CHARS = 6
+# Multi-fingerprint: take three substrings from spread positions. Verified
+# only if at least two match the capture (handles Docs auto-formatting
+# tweaks that might munge one substring).
+_VERIFY_FINGERPRINT_COUNT = 3
+_VERIFY_FINGERPRINT_REQUIRED_MATCHES = 2
 _HTML_TAG_RE = __import__("re").compile(r"<[^>]+>")
 _WHITESPACE_RE = __import__("re").compile(r"\s+")
+_NON_ALNUM_RE = __import__("re").compile(r"[^a-zA-Z0-9]")
 
 
 def _content_to_verification_plain(content: str, content_type: str) -> str:
@@ -320,8 +349,9 @@ def _content_to_verification_plain(content: str, content_type: str) -> str:
 def _pick_fingerprint(plain: str) -> str:
     """Pick a substring of `plain` that should survive into the Doc after paste.
 
-    We prefer a middle chunk so leading H1 / footer boilerplate doesn't bias
-    the check, but fall back to the whole string for short content.
+    Kept for backward compat / tests; new verification logic prefers the
+    multi-fingerprint path in `_pick_fingerprints` so a repetitive source
+    can't false-match against unrelated content.
     """
     if len(plain) <= _VERIFY_FINGERPRINT_LEN:
         return plain
@@ -332,33 +362,101 @@ def _pick_fingerprint(plain: str) -> str:
     return plain[:_VERIFY_FINGERPRINT_LEN]
 
 
+def _pick_fingerprints(plain: str) -> list[str]:
+    """Pick up to N spread-out substrings of `plain` for distinctiveness.
+
+    v0.3.5 MEDIUM #3 defense against low-entropy false positives. Returns
+    up to `_VERIFY_FINGERPRINT_COUNT` non-empty substrings sampled at evenly
+    spread offsets. For short content the whole string is the only entry.
+    """
+    if not plain:
+        return []
+    if len(plain) <= _VERIFY_FINGERPRINT_LEN:
+        return [plain]
+    n = _VERIFY_FINGERPRINT_COUNT
+    chunk_len = _VERIFY_FINGERPRINT_LEN
+    out: list[str] = []
+    for i in range(n):
+        # Offsets at 1/(n+1), 2/(n+1), ... so the first sample isn't at 0
+        # (avoids picking the header) and the last isn't at the very end.
+        start = max(0, (len(plain) * (i + 1)) // (n + 1) - chunk_len // 2)
+        chunk = plain[start : start + chunk_len].strip()
+        if len(chunk) >= _VERIFY_MIN_FINGERPRINT_LEN and chunk not in out:
+            out.append(chunk)
+    if not out:
+        out.append(plain[:chunk_len])
+    return out
+
+
+def _distinct_alnum_chars(s: str) -> int:
+    """Count unique alphanumeric chars in `s` (case-sensitive).
+
+    Cheap entropy proxy. A 60-char string of "AAAA..." returns 1; a sentence
+    returns 15-25.
+    """
+    return len(set(_NON_ALNUM_RE.sub("", s)))
+
+
 async def _verify_paste_landed(editor, source_plain: str):
     """After paste, verify the source content actually appeared in the Doc.
 
-    Returns `(verified, captured_plain, meta)`. On miss, retries once with a
-    longer wait (Docs canvas can lag past `paste_html`'s 1.5s settle). When
-    `source_plain` is empty (nothing meaningful to verify) we treat the
-    capture as authoritative and return `verified=True`.
+    Returns `(verified, captured_plain, meta)`. v0.3.5 hardening:
+
+    - **Empty source (MEDIUM #2)**: instead of auto-verifying, the capture
+      must also be near-empty (≤ `_VERIFY_EMPTY_SOURCE_MAX_CAPTURED_CHARS`).
+      Otherwise the paste didn't truly clear-and-replace.
+    - **Multi-fingerprint match (MEDIUM #3)**: pick 3 spread-out fingerprints;
+      require ≥ 2 matches in the capture. Defends against repetitive content
+      where a single 60-char window can false-match unrelated stale text.
+    - **Distinctiveness check**: if the combined fingerprints have fewer than
+      `_VERIFY_MIN_DISTINCT_CHARS` unique alphanumerics, the meta flag
+      `low_entropy_fingerprint=true` is set so callers know the verify
+      result is weaker evidence than usual.
+
+    Retry policy unchanged from v0.3.4: one retry after `_VERIFY_RETRY_WAIT_MS`.
+    Final failure returns `verified=False` so the caller refuses to save baseline.
     """
-    fingerprint = _pick_fingerprint(source_plain or "")
-    if not fingerprint:
+    if not (source_plain or "").strip():
+        # MEDIUM #2: empty source — capture must also be empty.
         captured = await capture_doc_plain(editor)
-        return True, captured, {
-            "fingerprint": "",
-            "fingerprint_present": True,
+        captured_norm = _WHITESPACE_RE.sub(" ", captured or "").strip()
+        verified = len(captured_norm) <= _VERIFY_EMPTY_SOURCE_MAX_CAPTURED_CHARS
+        return verified, captured, {
+            "fingerprints": [],
+            "fingerprints_matched": 0,
+            "fingerprints_required": 0,
+            "fingerprint_present": verified,
+            "empty_source": True,
+            "low_entropy_fingerprint": False,
             "retries": 0,
             "source_chars": 0,
-            "captured_chars": len(captured or ""),
+            "captured_chars": len(captured_norm),
         }
+
+    fingerprints = _pick_fingerprints(source_plain)
+    required = (
+        _VERIFY_FINGERPRINT_REQUIRED_MATCHES
+        if len(fingerprints) >= _VERIFY_FINGERPRINT_REQUIRED_MATCHES
+        else len(fingerprints)
+    )
+    distinct = _distinct_alnum_chars(" ".join(fingerprints))
+    low_entropy = distinct < _VERIFY_MIN_DISTINCT_CHARS
+
     captured = ""
     retries = 0
+    matched = 0
     for attempt in range(2):  # initial + 1 retry
         captured = await capture_doc_plain(editor)
         captured_norm = _WHITESPACE_RE.sub(" ", captured or "")
-        if fingerprint in captured_norm:
+        matched = sum(1 for fp in fingerprints if fp in captured_norm)
+        if matched >= required:
             return True, captured, {
-                "fingerprint": fingerprint[:80],
+                "fingerprints": [fp[:80] for fp in fingerprints],
+                "fingerprints_matched": matched,
+                "fingerprints_required": required,
                 "fingerprint_present": True,
+                "empty_source": False,
+                "low_entropy_fingerprint": low_entropy,
                 "retries": retries,
                 "source_chars": len(source_plain),
                 "captured_chars": len(captured_norm),
@@ -367,8 +465,12 @@ async def _verify_paste_landed(editor, source_plain: str):
             retries += 1
             await editor.page.wait_for_timeout(_VERIFY_RETRY_WAIT_MS)
     return False, captured, {
-        "fingerprint": fingerprint[:80],
+        "fingerprints": [fp[:80] for fp in fingerprints],
+        "fingerprints_matched": matched,
+        "fingerprints_required": required,
         "fingerprint_present": False,
+        "empty_source": False,
+        "low_entropy_fingerprint": low_entropy,
         "retries": retries,
         "source_chars": len(source_plain),
         "captured_chars": len(_WHITESPACE_RE.sub(" ", captured or "")),
