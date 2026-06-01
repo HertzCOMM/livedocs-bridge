@@ -613,6 +613,103 @@ async def test_verify_paste_landed_requires_two_of_three_fingerprints(monkeypatc
     assert meta["fingerprints_matched"] < meta["fingerprints_required"]
 
 
+def test_empty_capture_max_chars_default(monkeypatch):
+    monkeypatch.delenv("LIVEDOCS_VERIFY_EMPTY_CAPTURE_MAX_CHARS", raising=False)
+    assert tools._empty_capture_max_chars() == 80
+
+
+def test_empty_capture_max_chars_env_override(monkeypatch):
+    monkeypatch.setenv("LIVEDOCS_VERIFY_EMPTY_CAPTURE_MAX_CHARS", "240")
+    assert tools._empty_capture_max_chars() == 240
+
+
+def test_empty_capture_max_chars_env_garbage_falls_back(monkeypatch):
+    monkeypatch.setenv("LIVEDOCS_VERIFY_EMPTY_CAPTURE_MAX_CHARS", "garbage")
+    assert tools._empty_capture_max_chars() == 80
+
+
+def test_empty_capture_max_chars_env_zero_falls_back(monkeypatch):
+    monkeypatch.setenv("LIVEDOCS_VERIFY_EMPTY_CAPTURE_MAX_CHARS", "0")
+    assert tools._empty_capture_max_chars() == 80
+
+
+async def test_empty_source_threshold_respects_env(monkeypatch):
+    # v0.3.6 MEDIUM #2 residual: long Docs boilerplate locale can be tuned
+    # via env so the empty-source path doesn't false-fail.
+    async def fake_capture_doc_plain(editor):
+        return "boilerplate " * 18  # ~216 chars — would fail at default 80
+
+    monkeypatch.setattr(tools, "capture_doc_plain", fake_capture_doc_plain)
+    monkeypatch.setenv("LIVEDOCS_VERIFY_EMPTY_CAPTURE_MAX_CHARS", "300")
+    verified, _, meta = await _REAL_VERIFY_PASTE_LANDED(MagicMock(), "")
+    assert verified is True
+    assert meta["empty_capture_threshold"] == 300
+
+
+def test_pick_fingerprints_preserves_duplicates_when_offsets_align():
+    # v0.3.6 MEDIUM #3 residual: previously dedup collapsed identical chunks
+    # to 1 entry, weakening the 2-of-3 defense. v0.3.6 keeps duplicates so
+    # the Counter can encode "this chunk must appear N times in capture".
+    #
+    # We construct a source where the spread offsets predictably land on
+    # identical content: 30-char period × 12 reps = 360 chars; offsets at
+    # 60, 150, 240 with 60-char windows each capture two adjacent reps.
+    rep = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"  # 30 chars, high entropy
+    plain = rep * 12  # 360 chars
+    fps = tools._pick_fingerprints(plain)
+    assert len(fps) == 3, f"expected 3 chunks from spread offsets, got {fps}"
+    from collections import Counter
+
+    counts = Counter(fps)
+    # All three windows should be identical because the period (30) divides
+    # the offset stride evenly.
+    assert max(counts.values()) >= 2, (
+        f"expected at least one duplicate chunk when offsets align, "
+        f"got counts={dict(counts)}"
+    )
+
+
+async def test_verify_repetitive_source_requires_multi_occurrence(monkeypatch):
+    # When _pick_fingerprints produces duplicate chunks, the verifier must
+    # require the capture to contain the chunk N times — not just once.
+    # Pre-v0.3.6 the dedup made the check pass with a single match.
+    rep = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"  # 30 chars
+    source = rep * 12  # produces duplicate-aligned chunks
+
+    captured_value = rep * 2  # one chunk window worth
+
+    async def fake_capture_doc_plain(editor):
+        return captured_value
+
+    monkeypatch.setattr(tools, "capture_doc_plain", fake_capture_doc_plain)
+    editor = MagicMock()
+    editor.page = MagicMock()
+    editor.page.wait_for_timeout = AsyncMock()
+
+    verified, _, meta = await _REAL_VERIFY_PASTE_LANDED(editor, source)
+    # Expected count for the duplicate chunk is >= 2; capture only has 1
+    # occurrence → at least one expected_count is unmet → match drops.
+    assert "fingerprint_expected_counts" in meta
+    assert max(meta["fingerprint_expected_counts"].values()) >= 2
+    assert verified is False
+
+
+async def test_verify_repetitive_source_passes_when_capture_repeats(monkeypatch):
+    rep = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"
+    source = rep * 12
+
+    async def fake_capture_doc_plain(editor):
+        return source  # paste landed all repetitions
+
+    monkeypatch.setattr(tools, "capture_doc_plain", fake_capture_doc_plain)
+    editor = MagicMock()
+    editor.page = MagicMock()
+    editor.page.wait_for_timeout = AsyncMock()
+
+    verified, _, meta = await _REAL_VERIFY_PASTE_LANDED(editor, source)
+    assert verified is True
+
+
 async def test_replace_all_verification_failure_surfaces_reduced_drift_warning(
     monkeypatch, tmp_path
 ):

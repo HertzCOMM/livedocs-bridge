@@ -5,6 +5,47 @@ All notable changes to `livedocs-bridge` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - 2026-06-01
+
+Codex verification audit on v0.3.5 confirmed 0 new CRITICAL/HIGH and gave a
+clean M41 verdict. Two MEDIUM-level "partial" residuals were flagged and
+are closed here. (The third partial, "difflib still splits inputs ≤ 2 MiB
+internally", is pure efficiency overhead, not data safety; accepted.)
+
+### Fixed
+
+- **[MEDIUM #2 residual] 80-char empty-capture threshold was hardcoded.**
+  Some Docs locales inject longer smart-chip boilerplate, which would
+  false-fail the empty-source verification path. v0.3.6 makes the
+  threshold env-tunable via `LIVEDOCS_VERIFY_EMPTY_CAPTURE_MAX_CHARS`
+  (default 80). The response meta now carries `empty_capture_threshold`
+  so callers can confirm which value applied.
+- **[MEDIUM #3 residual] Fingerprint dedup defeated multi-fingerprint defense.**
+  When the 3 spread offsets landed on identical content (e.g. user pasted
+  the same paragraph multiple times), `chunk not in out` collapsed the
+  list to 1 fingerprint, and the 2-of-3 match requirement degraded to
+  1-of-1. v0.3.6 drops the dedup, preserves duplicates, and counts
+  occurrences with `collections.Counter`. A repeated chunk now requires
+  the capture to contain it ≥ N times to count as matched. New meta field
+  `fingerprint_expected_counts` exposes the per-chunk occurrence target.
+
+### Added
+
+- `LIVEDOCS_VERIFY_EMPTY_CAPTURE_MAX_CHARS` env var.
+- `livedocs_bridge.tools._empty_capture_max_chars` helper.
+- `paste_verification_meta.empty_capture_threshold` and
+  `paste_verification_meta.fingerprint_expected_counts` response fields.
+- 8 new regression tests (149 total).
+
+### Acknowledged residuals
+
+- **HIGH #1 internal difflib work**: `difflib.unified_diff` still does
+  full diff work on inputs up to the 2 MiB cap. Pure efficiency, not a
+  safety issue. The 2 MiB cap already bounds memory; the streaming
+  iterator already bounds output. Accepted.
+- **LOW #6 sub-1000ms timeout policy**: by-design (clamping intentionally
+  rejects sub-second connect deadlines as policy, not bug).
+
 ## [0.3.5] - 2026-06-01
 
 Codex adversarial audit on the v0.3.4 patches surfaced 1 HIGH, 4 MEDIUM,

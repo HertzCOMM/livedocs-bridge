@@ -306,29 +306,47 @@ def _short_diff(before: str, after: str, max_lines: int = 40) -> str:
     return summary
 
 
-# v0.3.4 / v0.3.5 — paste verification helpers (Bug 2 + codex audit hardening).
+# v0.3.4 / v0.3.5 / v0.3.6 — paste verification helpers
+# (Bug 2 + codex audit hardening + verification-audit partial residuals).
 
 _VERIFY_FINGERPRINT_LEN = 60
 _VERIFY_MIN_FINGERPRINT_LEN = 20
 _VERIFY_RETRY_WAIT_MS = 2500
-# v0.3.5 MEDIUM #2: empty source path. After a Cmd+A+Backspace clear and a
-# paste of "" the Doc body should be ~empty (Docs may inject smart-chip
+# v0.3.5 MEDIUM #2 / v0.3.6: empty source path. After a Cmd+A+Backspace clear
+# and a paste of "" the Doc body should be ~empty (Docs may inject smart-chip
 # placeholder text). If the captured body exceeds this, the paste didn't
-# land — fail closed.
-_VERIFY_EMPTY_SOURCE_MAX_CAPTURED_CHARS = 80
+# land — fail closed. v0.3.6 exposes the threshold via env so users hitting
+# longer locale-specific Docs boilerplate can raise it without forking.
+_DEFAULT_VERIFY_EMPTY_CAPTURE_MAX_CHARS = 80
 # v0.3.5 MEDIUM #3: fingerprint distinctiveness. Repetitive source like
 # "A" * 500 yields a "AAA" fingerprint that matches almost anything. We
 # require at least this many DISTINCT alphanumeric characters across the
-# combined fingerprint set, else we fall back to a hash-prefix check.
+# combined fingerprint set, else we flag `low_entropy_fingerprint`.
 _VERIFY_MIN_DISTINCT_CHARS = 6
 # Multi-fingerprint: take three substrings from spread positions. Verified
-# only if at least two match the capture (handles Docs auto-formatting
-# tweaks that might munge one substring).
+# only if at least two distinct fingerprints meet their expected occurrence
+# count (see v0.3.6 multi-occurrence section below).
 _VERIFY_FINGERPRINT_COUNT = 3
 _VERIFY_FINGERPRINT_REQUIRED_MATCHES = 2
 _HTML_TAG_RE = __import__("re").compile(r"<[^>]+>")
 _WHITESPACE_RE = __import__("re").compile(r"\s+")
 _NON_ALNUM_RE = __import__("re").compile(r"[^a-zA-Z0-9]")
+
+
+def _empty_capture_max_chars() -> int:
+    """Threshold for "essentially empty" capture, env-overridable.
+
+    Override with `LIVEDOCS_VERIFY_EMPTY_CAPTURE_MAX_CHARS`. Sub-1 values
+    fall back to the default; very large values are accepted as policy.
+    """
+    raw = os.environ.get("LIVEDOCS_VERIFY_EMPTY_CAPTURE_MAX_CHARS")
+    if not raw:
+        return _DEFAULT_VERIFY_EMPTY_CAPTURE_MAX_CHARS
+    try:
+        n = int(raw)
+        return n if n > 0 else _DEFAULT_VERIFY_EMPTY_CAPTURE_MAX_CHARS
+    except (TypeError, ValueError):
+        return _DEFAULT_VERIFY_EMPTY_CAPTURE_MAX_CHARS
 
 
 def _content_to_verification_plain(content: str, content_type: str) -> str:
@@ -368,6 +386,12 @@ def _pick_fingerprints(plain: str) -> list[str]:
     v0.3.5 MEDIUM #3 defense against low-entropy false positives. Returns
     up to `_VERIFY_FINGERPRINT_COUNT` non-empty substrings sampled at evenly
     spread offsets. For short content the whole string is the only entry.
+
+    v0.3.6: duplicates are PRESERVED (previously deduped). When two spread
+    offsets land on identical content (e.g. user pasted the same paragraph
+    three times), the verifier now requires the capture to contain that
+    chunk N times — not just once. This closes the "repeated-paragraph
+    collapse" gap the v0.3.5 verification audit flagged.
     """
     if not plain:
         return []
@@ -381,8 +405,8 @@ def _pick_fingerprints(plain: str) -> list[str]:
         # (avoids picking the header) and the last isn't at the very end.
         start = max(0, (len(plain) * (i + 1)) // (n + 1) - chunk_len // 2)
         chunk = plain[start : start + chunk_len].strip()
-        if len(chunk) >= _VERIFY_MIN_FINGERPRINT_LEN and chunk not in out:
-            out.append(chunk)
+        if len(chunk) >= _VERIFY_MIN_FINGERPRINT_LEN:
+            out.append(chunk)  # v0.3.6: NO dedup — duplicates carry expected-count info.
     if not out:
         out.append(plain[:chunk_len])
     return out
@@ -417,16 +441,19 @@ async def _verify_paste_landed(editor, source_plain: str):
     Final failure returns `verified=False` so the caller refuses to save baseline.
     """
     if not (source_plain or "").strip():
-        # MEDIUM #2: empty source — capture must also be empty.
+        # MEDIUM #2 / v0.3.6: empty source — capture must also be empty.
+        # Threshold is env-tunable for locales where Docs boilerplate is longer.
+        empty_cap = _empty_capture_max_chars()
         captured = await capture_doc_plain(editor)
         captured_norm = _WHITESPACE_RE.sub(" ", captured or "").strip()
-        verified = len(captured_norm) <= _VERIFY_EMPTY_SOURCE_MAX_CAPTURED_CHARS
+        verified = len(captured_norm) <= empty_cap
         return verified, captured, {
             "fingerprints": [],
             "fingerprints_matched": 0,
             "fingerprints_required": 0,
             "fingerprint_present": verified,
             "empty_source": True,
+            "empty_capture_threshold": empty_cap,
             "low_entropy_fingerprint": False,
             "retries": 0,
             "source_chars": 0,
@@ -434,12 +461,21 @@ async def _verify_paste_landed(editor, source_plain: str):
         }
 
     fingerprints = _pick_fingerprints(source_plain)
+    # v0.3.6 MEDIUM #3 residual: when offsets land on identical content the
+    # Counter encodes "this chunk must appear N times in capture". A chunk
+    # counts as MATCHED only when capture contains it ≥ expected count;
+    # otherwise the repeated-paragraph collapse drops 2-of-3 down to 1-of-1
+    # and the defense degrades.
+    from collections import Counter
+
+    expected_counts = Counter(fingerprints)
+    unique_fingerprints = list(expected_counts.keys())
     required = (
         _VERIFY_FINGERPRINT_REQUIRED_MATCHES
-        if len(fingerprints) >= _VERIFY_FINGERPRINT_REQUIRED_MATCHES
-        else len(fingerprints)
+        if len(unique_fingerprints) >= _VERIFY_FINGERPRINT_REQUIRED_MATCHES
+        else len(unique_fingerprints)
     )
-    distinct = _distinct_alnum_chars(" ".join(fingerprints))
+    distinct = _distinct_alnum_chars(" ".join(unique_fingerprints))
     low_entropy = distinct < _VERIFY_MIN_DISTINCT_CHARS
 
     captured = ""
@@ -448,10 +484,15 @@ async def _verify_paste_landed(editor, source_plain: str):
     for attempt in range(2):  # initial + 1 retry
         captured = await capture_doc_plain(editor)
         captured_norm = _WHITESPACE_RE.sub(" ", captured or "")
-        matched = sum(1 for fp in fingerprints if fp in captured_norm)
+        matched = sum(
+            1
+            for fp, expected in expected_counts.items()
+            if captured_norm.count(fp) >= expected
+        )
         if matched >= required:
             return True, captured, {
-                "fingerprints": [fp[:80] for fp in fingerprints],
+                "fingerprints": [fp[:80] for fp in unique_fingerprints],
+                "fingerprint_expected_counts": dict(expected_counts),
                 "fingerprints_matched": matched,
                 "fingerprints_required": required,
                 "fingerprint_present": True,
@@ -465,7 +506,8 @@ async def _verify_paste_landed(editor, source_plain: str):
             retries += 1
             await editor.page.wait_for_timeout(_VERIFY_RETRY_WAIT_MS)
     return False, captured, {
-        "fingerprints": [fp[:80] for fp in fingerprints],
+        "fingerprints": [fp[:80] for fp in unique_fingerprints],
+        "fingerprint_expected_counts": dict(expected_counts),
         "fingerprints_matched": matched,
         "fingerprints_required": required,
         "fingerprint_present": False,
