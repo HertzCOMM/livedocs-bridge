@@ -55,10 +55,37 @@ DEFAULT_RELOAD_TIMEOUT_MS = 30000
 # Ctrl on Windows/Linux, which is what we want everywhere. Available since
 # Playwright 1.40 (our declared minimum).
 
+# v0.3.4: Chrome's browser-wide CDP session corrupts after ~2-3 days of
+# uptime. `connect_over_cdp` then hangs at the protocol handshake even though
+# the HTTP `/json/version` probe still returns 200. Playwright default is
+# 180s; we cut to 30s and surface a specific error pointing at the only
+# in-band fix (kill + relaunch Chrome). Override with
+# `LIVEDOCS_CDP_CONNECT_TIMEOUT_MS`.
+DEFAULT_CDP_CONNECT_TIMEOUT_MS = 30000
+
+
+def get_cdp_connect_timeout_ms() -> int:
+    try:
+        return int(
+            os.environ.get(
+                "LIVEDOCS_CDP_CONNECT_TIMEOUT_MS", DEFAULT_CDP_CONNECT_TIMEOUT_MS
+            )
+        )
+    except (TypeError, ValueError):
+        return DEFAULT_CDP_CONNECT_TIMEOUT_MS
+
 
 def get_cdp_url() -> str:
     """Resolve the CDP endpoint from env (LIVEDOCS_CDP_URL) or default."""
     return os.environ.get("LIVEDOCS_CDP_URL", DEFAULT_CDP_URL)
+
+
+class CDPConnectTimeout(RuntimeError):
+    """Raised when `connect_over_cdp` hangs past the configured deadline.
+
+    Concrete signal that the user should kill + relaunch Chrome instead of
+    waiting another 150 seconds for the default Playwright timeout.
+    """
 
 
 @dataclass
@@ -95,7 +122,26 @@ class BrowserSession:
         if self._browser is not None:
             return
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.connect_over_cdp(self.cdp_url)
+        timeout_ms = get_cdp_connect_timeout_ms()
+        try:
+            self._browser = await self._pw.chromium.connect_over_cdp(
+                self.cdp_url, timeout=timeout_ms
+            )
+        except PlaywrightTimeout as e:
+            # Tear down the playwright instance so the next call gets a fresh
+            # one instead of inheriting a half-started state.
+            await self._pw.stop()
+            self._pw = None
+            raise CDPConnectTimeout(
+                f"connect_over_cdp({self.cdp_url}) timed out after "
+                f"{timeout_ms / 1000:.1f}s. This usually means Chrome's "
+                f"browser-wide CDP session has corrupted (typical after 2-3 "
+                f"days of uptime). The HTTP /json/version probe may still "
+                f"return 200 but the protocol handshake hangs. Recovery: "
+                f"kill the Chrome process and re-launch via "
+                f"`livedocs-bridge launch-chrome`. user-data-dir is "
+                f"persistent so your Google login survives."
+            ) from e
 
     async def stop(self) -> None:
         # We never close the browser — it belongs to the user.

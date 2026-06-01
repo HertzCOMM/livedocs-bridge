@@ -80,34 +80,50 @@ def test_default_backup_dir_falls_back_to_home(monkeypatch):
 
 
 def test_check_drift_returns_false_when_no_baseline(tmp_path):
-    drifted, summary = drift.check_drift("current text", "DOC_ID_1", tmp_path)
+    drifted, summary, meta = drift.check_drift(
+        "current text", "DOC_ID_1", tmp_path
+    )
     assert drifted is False
     assert "no baseline" in summary
+    assert meta == {}
 
 
 def test_save_and_check_drift_round_trip_no_drift(tmp_path):
     drift.save_last_push("identical content", "DOC_ID_2", tmp_path)
-    drifted, summary = drift.check_drift("identical content", "DOC_ID_2", tmp_path)
+    drifted, summary, meta = drift.check_drift(
+        "identical content", "DOC_ID_2", tmp_path
+    )
     assert drifted is False
     assert summary == ""
+    assert meta == {}
 
 
 def test_check_drift_detects_diff(tmp_path):
     drift.save_last_push("line one\nline two\n", "DOC_ID_3", tmp_path)
-    drifted, summary = drift.check_drift(
+    drifted, summary, meta = drift.check_drift(
         "line one\nUSER EDIT\nline two\n", "DOC_ID_3", tmp_path
     )
     assert drifted is True
     assert "USER EDIT" in summary
+    assert meta["hunks_total"] >= 1
+    assert meta["truncated"] is False
 
 
 def test_check_drift_truncates_long_diffs(tmp_path):
     base = "\n".join(f"line {i}" for i in range(200))
     current = "\n".join(f"NEW {i}" for i in range(200))
     drift.save_last_push(base, "DOC_ID_4", tmp_path)
-    drifted, summary = drift.check_drift(current, "DOC_ID_4", tmp_path, diff_max_lines=20)
+    drifted, summary, meta = drift.check_drift(
+        current, "DOC_ID_4", tmp_path, diff_max_lines=20
+    )
     assert drifted is True
-    assert "truncated" in summary
+    # v0.3.4: truncation banner is loud and at the TOP of the summary.
+    assert "TRUNCATED" in summary or "truncated" in summary.lower()
+    assert meta["truncated"] is True
+    assert meta["lines_shown"] == 20
+    assert meta["lines_total"] > 20
+    # Show count should never exceed total.
+    assert meta["hunks_shown"] <= meta["hunks_total"]
 
 
 def test_prune_old_backups_removes_old(tmp_path):
@@ -212,6 +228,43 @@ def test_save_last_push_is_atomic(tmp_path):
     assert p1.read_text(encoding="utf-8") == "second"
     leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
     assert leftovers == []
+
+
+# v0.3.4 — Bug 1 regression: drift summary must surface hunk counts so an
+# agent isn't tricked into thinking the displayed slice is the whole drift.
+
+def test_check_drift_counts_all_hunks(tmp_path):
+    # Build a baseline + current with multiple distinct hunks separated by
+    # enough context to render as separate `@@` blocks.
+    base = "\n".join(["§1 untouched line " + str(i) for i in range(200)])
+    current_lines = ["§1 untouched line " + str(i) for i in range(200)]
+    current_lines[10] = "§2 USER EDIT A"
+    current_lines[100] = "§4 USER EDIT B"
+    current_lines[180] = "§6 USER EDIT C"
+    current = "\n".join(current_lines)
+    drift.save_last_push(base, "DOC_HUNKS", tmp_path)
+    drifted, summary, meta = drift.check_drift(current, "DOC_HUNKS", tmp_path)
+    assert drifted is True
+    assert meta["hunks_total"] >= 3, (
+        f"Expected at least 3 hunks for 3 spread-out edits, got "
+        f"hunks_total={meta['hunks_total']}, summary:\n{summary}"
+    )
+
+
+def test_check_drift_truncation_warning_is_at_top(tmp_path):
+    # Verify the loud truncation banner is BEFORE the diff body — an agent
+    # reading top-down should hit the "force=True overwrites ALL drift"
+    # warning before being lulled by a small-looking diff slice.
+    base = "\n".join(f"line {i}" for i in range(500))
+    current = "\n".join(f"NEW {i}" for i in range(500))
+    drift.save_last_push(base, "DOC_TRUNC", tmp_path)
+    _, summary, meta = drift.check_drift(
+        current, "DOC_TRUNC", tmp_path, diff_max_lines=30
+    )
+    first_line = summary.splitlines()[0]
+    assert "TRUNCATED" in first_line
+    assert "force=True" in first_line.lower() or "force" in summary.splitlines()[0].lower()
+    assert meta["truncated"] is True
 
 
 def test_atomic_write_uses_unique_tmp_filename(tmp_path, monkeypatch):

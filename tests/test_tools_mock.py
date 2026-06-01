@@ -102,6 +102,21 @@ def _patch_common(
         }
 
     monkeypatch.setattr(tools, "backup_doc", fake_backup)
+
+    # v0.3.4: every docs_replace_all path now runs _verify_paste_landed before
+    # saving baseline. Default the mock to "verified" so existing scenarios
+    # don't have to thread fingerprint matching through their mocks; failure
+    # paths override this in their own tests.
+    async def fake_verify(editor, source_plain):
+        return True, post_text, {
+            "fingerprint": (source_plain or "")[:60],
+            "fingerprint_present": True,
+            "retries": 0,
+            "source_chars": len(source_plain or ""),
+            "captured_chars": len(post_text or ""),
+        }
+
+    monkeypatch.setattr(tools, "_verify_paste_landed", fake_verify)
     return page, backup_dir
 
 
@@ -410,3 +425,92 @@ def baseline_dir_ancestor(parent: Path, child: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+# -----------------------------------------------------------------------------
+# v0.3.4 — Bug 2 regressions: paste verification + baseline corruption guard.
+# -----------------------------------------------------------------------------
+
+
+def test_content_to_verification_plain_strips_html():
+    out = tools._content_to_verification_plain(
+        "<h1>Hi</h1>  <p>world  again</p>", "html"
+    )
+    assert "<" not in out and ">" not in out
+    assert "  " not in out  # whitespace collapsed
+    assert "Hi" in out and "world" in out
+
+
+def test_content_to_verification_plain_preserves_markdown_text():
+    out = tools._content_to_verification_plain(
+        "## Heading\n\nliquidity fragmentation removed", "markdown"
+    )
+    assert "Heading" in out
+    assert "liquidity fragmentation removed" in out
+
+
+def test_pick_fingerprint_short_content_returned_verbatim():
+    assert tools._pick_fingerprint("short") == "short"
+
+
+def test_pick_fingerprint_long_content_returns_middle_chunk():
+    long = "PREFIX " * 5 + "DISTINCTIVE_MIDDLE_CHUNK_KEYWORD " + "SUFFIX " * 5
+    fp = tools._pick_fingerprint(long)
+    assert "DISTINCTIVE_MIDDLE_CHUNK_KEYWORD" in fp or "PREFIX" in fp
+    assert 0 < len(fp) <= 80
+
+
+async def test_replace_all_aborts_when_paste_verification_fails(monkeypatch, tmp_path):
+    # Real production incident: paste silently no-opped, capture saw old
+    # content, baseline got saved as old content, next inject saw "drift"
+    # (user's real edits vs corrupted baseline) and force=True overwrote them.
+    # Defense: refuse to save baseline when verification fails.
+    page, backup_dir = _patch_common(monkeypatch, tmp_path, post_text="paste-OK")
+
+    async def fake_verify_fails(editor, source_plain):
+        return False, "OLD CONTENT (paste no-opped)", {
+            "fingerprint": (source_plain or "")[:60],
+            "fingerprint_present": False,
+            "retries": 1,
+            "source_chars": len(source_plain or ""),
+            "captured_chars": 30,
+        }
+
+    monkeypatch.setattr(tools, "_verify_paste_landed", fake_verify_fails)
+    res = await tools.docs_replace_all("liquidity fragmentation removed", "markdown")
+    assert res["success"] is False
+    assert res["paste_verification_failed"] is True
+    assert res["baseline_saved"] is False
+    assert res["recommended_next_action"]  # non-empty actionable string
+    # Baseline file must NOT exist after a verification failure.
+    doc_id = drift_mod.safe_doc_key(page.url)
+    assert not drift_mod.last_push_path(backup_dir, doc_id).exists()
+
+
+async def test_replace_all_saves_baseline_only_when_verified(monkeypatch, tmp_path):
+    page, backup_dir = _patch_common(monkeypatch, tmp_path, post_text="verified-text")
+    res = await tools.docs_replace_all("# anything", "markdown")
+    assert res["success"] is True
+    assert res["paste_verified"] is True
+    assert res["baseline_saved"] is True
+    doc_id = drift_mod.safe_doc_key(page.url)
+    assert drift_mod.last_push_path(backup_dir, doc_id).read_text() == "verified-text"
+
+
+async def test_replace_all_surfaces_drift_hunk_meta(monkeypatch, tmp_path):
+    # Bug 1 regression at the tools.py level: agent receives hunk counts so
+    # it can't be tricked by a truncated diff into running force=True blind.
+    page, backup_dir = _patch_common(
+        monkeypatch, tmp_path, pre_text="baseline content"
+    )
+    doc_id = drift_mod.safe_doc_key(page.url)
+    drift_mod.save_last_push(
+        "different baseline\nwith multiple\nlines that differ", doc_id, backup_dir
+    )
+    res = await tools.docs_replace_all("# new", "markdown")
+    assert res["success"] is False
+    assert res["drift_detected"] is True
+    assert "drift_hunks_total" in res
+    assert isinstance(res["drift_hunks_total"], int)
+    assert res["drift_hunks_total"] >= 1
+    assert "drift_truncated" in res

@@ -172,13 +172,18 @@ async def docs_replace_all(
                     ),
                 )
 
-            drifted, diff = drift_mod.check_drift(current_plain, doc_id, backup_dir)
+            drifted, diff, drift_meta = drift_mod.check_drift(
+                current_plain, doc_id, backup_dir
+            )
             if drifted and not force:
                 return _err(
                     "Doc drifted since last push; refusing to overwrite without force=True.",
                     doc_url=page.url,
                     drift_detected=True,
                     drift_summary=diff,
+                    drift_hunks_total=drift_meta.get("hunks_total"),
+                    drift_hunks_shown=drift_meta.get("hunks_shown"),
+                    drift_truncated=drift_meta.get("truncated", False),
                     backup_paths=_paths_dict(backup),
                 )
 
@@ -215,7 +220,34 @@ async def docs_replace_all(
                     recommended_next_action="docs_restore_from_backup",
                 )
 
-            new_plain = await capture_doc_plain(editor)
+            # v0.3.4 Bug 2: paste verification. Production incident: paste
+            # silently no-opped (or capture saw pre-paste state), capture
+            # returned old/empty content, baseline saved as old content,
+            # next inject saw "drift" (user's real edits vs corrupted baseline)
+            # and force=True silently overwrote them. Defense: extract a
+            # fingerprint from what we just sent, verify it appears in the
+            # capture, retry once on miss, FAIL CLOSED without saving baseline.
+            sent_plain = _content_to_verification_plain(content, content_type)
+            verified, new_plain, verify_meta = await _verify_paste_landed(
+                editor, sent_plain
+            )
+            if not verified:
+                return _err(
+                    "paste verification failed: captured Doc text does not contain "
+                    "expected content. Baseline NOT updated to avoid corrupting drift "
+                    "detection on next inject.",
+                    doc_url=page.url,
+                    paste_verification_failed=True,
+                    paste_verification_meta=verify_meta,
+                    backup_paths=_paths_dict(backup),
+                    baseline_saved=False,
+                    recommended_next_action=(
+                        "Screenshot the Doc with `docs_screenshot` to confirm "
+                        "visually. If content is wrong, `docs_restore_from_backup` "
+                        "to recover. If content is correct, the read-back failed — "
+                        "re-run `docs_replace_all` (drift will catch real divergence)."
+                    ),
+                )
             baseline_path = drift_mod.save_last_push(new_plain, doc_id, backup_dir)
             return _ok(
                 {
@@ -224,8 +256,12 @@ async def docs_replace_all(
                     "html_bytes": len(html),
                     "drift_detected": drifted,
                     "drift_summary": diff if drifted else "",
+                    "drift_hunks_total": drift_meta.get("hunks_total") if drifted else 0,
+                    "drift_truncated": drift_meta.get("truncated", False) if drifted else False,
                     "toctou_detected": recapture_diverged,
                     "capture_failed": capture_failed,
+                    "paste_verified": True,
+                    "paste_verification_meta": verify_meta,
                     "backup_paths": _paths_dict(backup),
                     "baseline_saved": True,
                     "baseline_path": str(baseline_path),
@@ -255,6 +291,88 @@ def _short_diff(before: str, after: str, max_lines: int = 40) -> str:
     if len(lines) > max_lines:
         summary += f"\n... ({len(lines) - max_lines} more diff lines truncated)"
     return summary
+
+
+# v0.3.4 — paste verification helpers (Bug 2).
+
+_VERIFY_FINGERPRINT_LEN = 60
+_VERIFY_MIN_FINGERPRINT_LEN = 20
+_VERIFY_RETRY_WAIT_MS = 2500
+_HTML_TAG_RE = __import__("re").compile(r"<[^>]+>")
+_WHITESPACE_RE = __import__("re").compile(r"\s+")
+
+
+def _content_to_verification_plain(content: str, content_type: str) -> str:
+    """Reduce `content` to the plain text we expect to see in the Doc.
+
+    For markdown we use the source as-is (Docs renders headings/tables, but
+    the underlying TEXT is unchanged — `## Heading` becomes `Heading`).
+    For HTML we strip tags. In both cases whitespace is collapsed so a
+    multi-line source still matches the single-stream clipboard capture.
+    """
+    if (content_type or "markdown").strip().lower() == "html":
+        raw = _HTML_TAG_RE.sub(" ", content)
+    else:
+        raw = content
+    return _WHITESPACE_RE.sub(" ", raw).strip()
+
+
+def _pick_fingerprint(plain: str) -> str:
+    """Pick a substring of `plain` that should survive into the Doc after paste.
+
+    We prefer a middle chunk so leading H1 / footer boilerplate doesn't bias
+    the check, but fall back to the whole string for short content.
+    """
+    if len(plain) <= _VERIFY_FINGERPRINT_LEN:
+        return plain
+    mid = len(plain) // 3
+    chunk = plain[mid : mid + _VERIFY_FINGERPRINT_LEN].strip()
+    if len(chunk) >= _VERIFY_MIN_FINGERPRINT_LEN:
+        return chunk
+    return plain[:_VERIFY_FINGERPRINT_LEN]
+
+
+async def _verify_paste_landed(editor, source_plain: str):
+    """After paste, verify the source content actually appeared in the Doc.
+
+    Returns `(verified, captured_plain, meta)`. On miss, retries once with a
+    longer wait (Docs canvas can lag past `paste_html`'s 1.5s settle). When
+    `source_plain` is empty (nothing meaningful to verify) we treat the
+    capture as authoritative and return `verified=True`.
+    """
+    fingerprint = _pick_fingerprint(source_plain or "")
+    if not fingerprint:
+        captured = await capture_doc_plain(editor)
+        return True, captured, {
+            "fingerprint": "",
+            "fingerprint_present": True,
+            "retries": 0,
+            "source_chars": 0,
+            "captured_chars": len(captured or ""),
+        }
+    captured = ""
+    retries = 0
+    for attempt in range(2):  # initial + 1 retry
+        captured = await capture_doc_plain(editor)
+        captured_norm = _WHITESPACE_RE.sub(" ", captured or "")
+        if fingerprint in captured_norm:
+            return True, captured, {
+                "fingerprint": fingerprint[:80],
+                "fingerprint_present": True,
+                "retries": retries,
+                "source_chars": len(source_plain),
+                "captured_chars": len(captured_norm),
+            }
+        if attempt == 0:
+            retries += 1
+            await editor.page.wait_for_timeout(_VERIFY_RETRY_WAIT_MS)
+    return False, captured, {
+        "fingerprint": fingerprint[:80],
+        "fingerprint_present": False,
+        "retries": retries,
+        "source_chars": len(source_plain),
+        "captured_chars": len(_WHITESPACE_RE.sub(" ", captured or "")),
+    }
 
 
 async def docs_append(
@@ -445,13 +563,18 @@ async def docs_check_drift(doc_url: Optional[str] = None) -> dict[str, Any]:
             current_plain = await capture_doc_plain(editor)
             doc_id = drift_mod.safe_doc_key(doc_url or page.url)
             baseline_path = drift_mod.last_push_path(backup_dir, doc_id)
-            drifted, diff = drift_mod.check_drift(current_plain, doc_id, backup_dir)
+            drifted, diff, drift_meta = drift_mod.check_drift(
+                current_plain, doc_id, backup_dir
+            )
             return _ok(
                 {
                     "doc_url": page.url,
                     "doc_id": doc_id,
                     "drifted": drifted,
                     "drift_summary": diff,
+                    "drift_hunks_total": drift_meta.get("hunks_total", 0),
+                    "drift_hunks_shown": drift_meta.get("hunks_shown", 0),
+                    "drift_truncated": drift_meta.get("truncated", False),
                     "baseline_exists": baseline_path.exists(),
                     "baseline_path": str(baseline_path) if baseline_path.exists() else None,
                     "clipboard_overwritten": True,

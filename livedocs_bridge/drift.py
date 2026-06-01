@@ -162,24 +162,33 @@ def check_drift(
     current_plain: str,
     doc_url_or_id: str,
     backup_dir: Optional[Path | str] = None,
-    diff_max_lines: int = 80,
-) -> tuple[bool, str]:
+    diff_max_lines: int = 200,
+) -> tuple[bool, str, dict]:
     """Compare `current_plain` against the saved baseline for this Doc.
 
     Returns:
-        (drifted, diff_summary).
+        `(drifted, diff_summary, meta)` where `meta` has the shape
+        `{hunks_total, hunks_shown, lines_total, lines_shown, truncated}`.
 
     Important: when no baseline exists yet (first inject for this Doc), we
-    return `(False, "[no baseline ...]")` rather than `True`. Treating
+    return `(False, "[no baseline ...]", {})` rather than `True`. Treating
     first-inject as drift would force every fresh Doc into `--force` mode.
+
+    v0.3.4: returns a 3-tuple now (was 2-tuple in v0.3.0-v0.3.3). The third
+    element is a hunk/line accounting dict so callers can surface "agent only
+    saw N of M hunks" to a UI before the user approves `force=True`. The
+    old 2-tuple silently truncated drift to the first 80 diff lines; a real
+    production incident lost user edits because §4 hunks were past the cap
+    and the agent assumed §6 was the only drifted section. Default cap also
+    raised 80 → 200.
     """
     root = resolve_backup_dir(backup_dir)
     path = last_push_path(root, doc_url_or_id)
     if not path.exists():
-        return False, "[no baseline — first inject for this doc]"
+        return False, "[no baseline — first inject for this doc]", {}
     last = path.read_text(encoding="utf-8")
     if last.strip() == (current_plain or "").strip():
-        return False, ""
+        return False, "", {}
     diff_lines = list(
         difflib.unified_diff(
             last.splitlines(),
@@ -190,10 +199,35 @@ def check_drift(
             n=2,
         )
     )
-    summary = "\n".join(diff_lines[:diff_max_lines])
-    if len(diff_lines) > diff_max_lines:
-        summary += f"\n... ({len(diff_lines) - diff_max_lines} more diff lines truncated)"
-    return True, summary
+    hunks_total = sum(1 for ln in diff_lines if ln.startswith("@@"))
+    shown_lines = diff_lines[:diff_max_lines]
+    hunks_shown = sum(1 for ln in shown_lines if ln.startswith("@@"))
+    truncated = len(diff_lines) > diff_max_lines
+
+    summary_parts: list[str] = []
+    if truncated:
+        # Loud warning at the TOP so an agent reading top-down sees it before
+        # the diff itself. `force=True` overwrites ALL drift, not just shown.
+        summary_parts.append(
+            f"⚠ DRIFT TRUNCATED: showing {hunks_shown} of {hunks_total} "
+            f"hunks ({len(shown_lines)} of {len(diff_lines)} diff lines). "
+            f"`force=True` overwrites ALL drift including the hidden hunks."
+        )
+        summary_parts.append("")
+    summary_parts.append("\n".join(shown_lines))
+    if truncated:
+        summary_parts.append(
+            f"... ({len(diff_lines) - len(shown_lines)} more diff lines, "
+            f"{hunks_total - hunks_shown} more hunks hidden)"
+        )
+    meta = {
+        "hunks_total": hunks_total,
+        "hunks_shown": hunks_shown,
+        "lines_total": len(diff_lines),
+        "lines_shown": len(shown_lines),
+        "truncated": truncated,
+    }
+    return True, "\n".join(summary_parts), meta
 
 
 def prune_old_backups(

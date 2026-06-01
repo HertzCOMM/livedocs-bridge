@@ -5,6 +5,66 @@ All notable changes to `livedocs-bridge` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-06-01
+
+Three production bugs from real workflow use of the underlying skill (see
+report from 2026-06-01 session). All three are now fixed in the MCP wrapper.
+
+### Fixed
+
+- **[Bug 1] Drift summary truncation silently hid hunks.** When a Doc had
+  edits in multiple sections, `check_drift` returned only the first 80 diff
+  lines. An agent reading the response saw the §6 hunk and assumed it was
+  the only drift; on `force=True` the §4 hunks were silently overwritten.
+  `check_drift` now returns a 3-tuple `(drifted, summary, meta)` with
+  `meta["hunks_total"] / hunks_shown / lines_total / lines_shown / truncated`.
+  When truncated, a loud `⚠ DRIFT TRUNCATED: showing N of M hunks; force=True
+  overwrites ALL drift including the hidden hunks` banner is prepended to
+  the summary. Default cap raised 80 → 200 lines. Both `docs_replace_all`
+  and `docs_check_drift` responses now surface `drift_hunks_total` and
+  `drift_truncated`.
+- **[Bug 2] Silent paste failure + corrupted baseline.** Real incident:
+  user added a sentence to a memo, ran replace, script reported DONE, the
+  addition was missing from the Doc AND from the saved baseline. The
+  post-paste `Cmd+A + Cmd+C` capture either ran during render lag or never
+  saw the paste land — but the empty/old capture was saved as the new
+  baseline anyway. Next inject saw "drift" (user's real edits vs corrupted
+  baseline) and `force=True` overwrote them. `docs_replace_all` now extracts
+  a 60-char fingerprint from the source content (HTML-stripped, whitespace-
+  collapsed), verifies it appears in the post-paste capture, retries once
+  with a 2.5 s wait on miss, and **refuses to save the baseline** when
+  verification ultimately fails. Response carries `paste_verification_failed:
+  true` + `paste_verification_meta` + a concrete `recommended_next_action`
+  (screenshot first, then restore-from-backup if visually wrong).
+- **[Bug 3] CDP connect hung 180 s on corrupted Chrome session.** After
+  ~2-3 days of Chrome uptime, `connect_over_cdp` hangs at the protocol
+  handshake even though `/json/version` still returns 200. v0.3.4 caps the
+  connect timeout at 30 s (override via `LIVEDOCS_CDP_CONNECT_TIMEOUT_MS`)
+  and raises a new `CDPConnectTimeout` with a concrete recovery path
+  (kill + relaunch via `livedocs-bridge launch-chrome`; user-data-dir is
+  persistent so login survives). No more 180 s silent stalls.
+
+### Changed
+
+- `livedocs_bridge.drift.check_drift` return type changed from
+  `tuple[bool, str]` → `tuple[bool, str, dict]`. Internal callers updated.
+  External callers (if any) must unpack 3 values.
+- Default `check_drift(diff_max_lines=...)` raised 80 → 200.
+
+### Added
+
+- `LIVEDOCS_CDP_CONNECT_TIMEOUT_MS` env var (default 30000 ms).
+- `livedocs_bridge.playwright_core.CDPConnectTimeout` exception class.
+- `livedocs_bridge.tools._content_to_verification_plain` /
+  `_pick_fingerprint` / `_verify_paste_landed` helpers.
+- 16 new regression tests (122 total).
+
+### Notes
+
+- v0.3.4 is **strongly recommended** for anyone using `docs_replace_all` —
+  Bug 2 silently corrupted baselines on every Docs render lag spike and the
+  next inject would silently overwrite user edits.
+
 ## [0.3.3] - 2026-06-01
 
 Windows / Linux keyboard fix. v0.3.2 and earlier hardcoded `Meta+<key>` for
